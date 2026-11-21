@@ -1,0 +1,13 @@
+/target/
+/dist/
+/exports/
+/.homeops/
+**/device-book.json
+**/inventory.json
+**/hosts.csv
+**/HomeOps-export-*/
+*.pem
+*.key
+*.ppk
+*.env
+*.local
