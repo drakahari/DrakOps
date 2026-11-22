@@ -7,6 +7,7 @@ mod lan_discovery;
 mod lan_review;
 mod device_art;
 mod terminal;
+mod terminal_find;
 mod terminal_ui;
 mod external_terminal;
 mod ssh_setup;

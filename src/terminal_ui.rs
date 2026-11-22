@@ -1,5 +1,6 @@
 use super::{App, Device, Route, egui, theme};
 use crate::terminal::{self, Session};
+use crate::terminal_find::{self,Direction};
 use egui::{Color32, FontFamily, FontId, Key, RichText, TextFormat, text::LayoutJob};
 use std::{sync::{Arc,atomic::{AtomicUsize,Ordering}},time::Duration};
 
@@ -178,6 +179,7 @@ struct TerminalTab {
     closing: bool,
     copied_until: Option<f64>,
     scroll: ScrollGesture,
+    find: terminal_find::Find,
 }
 impl TerminalTab {
     fn active(&self)->bool {self.session.as_ref().is_some_and(|s|s.state().is_active())}
@@ -610,6 +612,7 @@ impl TerminalUi {
                 let mut paste_click=false;
                 let mut copy_click=false;
                 let mut jump_live=false;
+                let mut find_click=false;
                 let mut page_direction=0_isize;
                 let (mut offset, limit)=t.session.as_mut().map(Session::scrollback).unwrap_or_default();
                 let alternate=t.session.as_ref().is_some_and(|s|s.screen().alternate_screen());
@@ -619,6 +622,8 @@ impl TerminalUi {
                     ui.label(RichText::new(&t.target).monospace());
                     if let Some(s)=&t.session{ui.weak(s.state().label());}
                     if t.session.is_some() {
+                        find_click=ui.add_enabled(!alternate,egui::Button::new("Find").small())
+                            .on_hover_text("Find text locally in this tab's terminal").clicked();
                         if ui.add_enabled(offset<limit && !alternate,egui::Button::new("Older").small())
                             .on_hover_text("Scroll back one page locally").clicked(){page_direction=1;}
                         if ui.add_enabled(offset>0 && !alternate,egui::Button::new("Newer").small())
@@ -630,12 +635,16 @@ impl TerminalUi {
                     }
                     if t.demo.is_some(){ui.weak("Read-only sample. No SSH connection.");}
                     if t.session.as_ref().is_some_and(|s| matches!(s.state(),terminal::State::Running)) {
-                        paste_click=ui.small_button("Paste").on_hover_text("Review one line locally before sending").clicked();
-                        if ui.small_button(if deck.copy_mode {"Back to terminal"}else{"Select text"}).clicked(){deck.copy_mode=!deck.copy_mode;deck.capture=false;deck.drag_start=None;}
-                        if deck.copy_mode {copy_click=ui.small_button("Copy selection").clicked();}
+                        paste_click=ui.add_enabled(!t.find.open,egui::Button::new("Paste").small())
+                            .on_hover_text("Review one line locally before sending").clicked();
+                        if ui.add_enabled(!t.find.open,egui::Button::new(if deck.copy_mode {"Back to terminal"}else{"Select text"}).small()).clicked(){
+                            deck.copy_mode=!deck.copy_mode;deck.capture=false;deck.drag_start=None;
+                        }
+                        if deck.copy_mode {copy_click=ui.add_enabled(!t.find.open,egui::Button::new("Copy selection").small()).clicked();}
                         ui.weak(if deck.capture {"Keyboard active | Ctrl+Esc to release"} else {"Click terminal to type | Drag to select | Tab then F2 for keyboard"});
                     }
-                    if let Some(s)=&t.session && matches!(s.state(),terminal::State::Running) && ui.button("Send Ctrl+C").clicked(){
+                    if let Some(s)=&t.session && matches!(s.state(),terminal::State::Running) &&
+                        !find_click && ui.add_enabled(!t.find.open,egui::Button::new("Send Ctrl+C")).clicked(){
                         if let Err(e)=s.send(&[3]){t.error=e;}
                     }
                     if t.active() && ui.button("Disconnect").clicked(){deck.capture=false;t.stop();}
@@ -703,7 +712,43 @@ impl TerminalUi {
                         }
                     }
                 }
-                let blocked=paste_was_open || paste_click;
+                let find_was_open=t.find.open;
+                if find_click && !paste_was_open && !paste_click {
+                    t.find.open=true;
+                    t.find.first_frame=true;
+                    deck.capture=false;
+                }
+                let mut found_offset=None;
+                if t.find.open && (alternate || switched || close_tab || !focused) {
+                    t.find.open=false;
+                } else if t.find.open && !paste_was_open && !paste_click &&
+                    let Some(s)=t.session.as_mut() {
+                    let mut open=true;
+                    let mut direction=None;
+                    egui::Window::new("Find in terminal").id(egui::Id::new(("terminal-find",tab_id)))
+                        .anchor(egui::Align2::RIGHT_TOP,[-12.,24.])
+                        .open(&mut open).collapsible(false).resizable(false).show(ctx,|ui|{
+                            let field=ui.add(egui::TextEdit::singleline(&mut t.find.query)
+                                .char_limit(256).hint_text("Find text in this tab"));
+                            if t.find.first_frame {field.request_focus();t.find.first_frame=false;}
+                            if field.changed() {t.find.changed();}
+                            if field.lost_focus() && ui.input(|i|i.key_pressed(Key::Enter)) && !t.find.query.is_empty() {
+                                direction=Some(if ui.input(|i|i.modifiers.shift) {Direction::Previous} else {Direction::Next});
+                                field.request_focus();
+                            }
+                            ui.horizontal(|ui|{
+                                if ui.add_enabled(!t.find.query.is_empty(),egui::Button::new("Previous")).clicked(){direction=Some(Direction::Previous);}
+                                if ui.add_enabled(!t.find.query.is_empty(),egui::Button::new("Next")).clicked(){direction=Some(Direction::Next);}
+                            });
+                            if !t.find.status.is_empty(){ui.weak(&t.find.status);}
+                            if let Some(row)=t.find.highlighted_row(){ui.weak(format!("Terminal row {}",row+1));}
+                        });
+                    if !open {t.find.open=false;}
+                    else if let Some(direction)=direction {
+                        found_offset=t.find.apply(s.find_text(&t.find.query),direction);
+                    }
+                }
+                let blocked=paste_was_open || paste_click || find_was_open || find_click || t.find.open;
                 let allow_history=deck.show && !switched && !close_tab && !deck.close_app && !blocked && focused;
                 let frame_bounds=ui.clip_rect().intersect(rect);
                 let hover=ui.input(|i| (!i.pointer.primary_down()).then(|| i.pointer.hover_pos()).flatten());
@@ -715,14 +760,20 @@ impl TerminalUi {
                     })
                 }else{0.};
                 let original_offset=offset;
-                if jump_live {
+                if let Some(destination)=found_offset {
+                    offset=destination;
+                    t.scroll.wheel_remainder=0.;
+                } else if jump_live {
                     offset=0;
+                    t.find.changed();
                     t.scroll.wheel_remainder=0.;
                 } else if page_direction!=0 {
                     offset=offset.saturating_add_signed(page_direction*page_rows).min(limit);
                     t.scroll.wheel_remainder=0.;
+                    t.find.changed();
                 } else if wheel != 0. {
                     offset=t.scroll.wheel(wheel,offset,limit);
+                    t.find.changed();
                 }
                 let mut bar_active=false;
                 if limit>0 {
@@ -732,11 +783,12 @@ impl TerminalUi {
                     let after=scroll_bar(ui,gutter,tab_id,dims,offset,limit,&mut t.scroll,allow_history);
                     bar_active=after!=offset || ui.input(|i|i.pointer.primary_down() &&
                         i.pointer.press_origin().is_some_and(|pos|gutter.contains(pos)));
+                    if after!=offset {t.find.changed();}
                     offset=after;
                 } else {
                     t.scroll=ScrollGesture::default();
                 }
-                let navigating=jump_live || page_direction!=0 || wheel!=0. || bar_active;
+                let navigating=found_offset.is_some() || jump_live || page_direction!=0 || wheel!=0. || bar_active;
                 if offset!=original_offset || bar_active {
                     if offset!=original_offset && let Some(s)=t.session.as_mut() {s.set_scrollback(offset);}
                     deck.drag_start=None;
@@ -940,6 +992,30 @@ mod tests {
                 clipped.clip_rect.intersects(egui::Rect::from_min_size(text.pos,text.galley.size())))
         });
         assert!(visible,"last row should be visible without truncating the finished screen buffer");
+    }
+
+    #[test]
+    fn find_query_and_enter_remain_local_even_with_an_active_session() {
+        let ctx=egui::Context::default();
+        let (session,io)=crate::terminal::tests::synthetic_io();
+        let mut deck=TerminalUi {
+            show:true,capture:true,
+            tabs:vec![TerminalTab {id:25,session:Some(session),target:"fixture".into(),..Default::default()}],
+            ..Default::default()
+        };
+        deck.tabs[0].find.open=true;
+        deck.tabs[0].find.first_frame=true;
+        let mut frame=|events| {
+            let bounds=egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(800.,600.));
+            let _=ctx.run(egui::RawInput{screen_rect:Some(bounds),focused:true,events,..Default::default()},|ctx|deck.panel(ctx,false));
+        };
+        frame(vec![]);
+        frame(vec![egui::Event::Text("local needle".into())]);
+        let enter=egui::Event::Key{key:Key::Enter,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::NONE};
+        frame(vec![enter]);
+        assert!(!deck.capture);
+        assert_eq!(deck.tabs[0].find.query,"local needle");
+        assert!(io.input.try_recv().is_err());
     }
 
     use egui::Modifiers;

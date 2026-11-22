@@ -125,6 +125,10 @@ impl Session {
         self.parser.screen_mut().set_scrollback(rows.min(SCROLLBACK));
     }
 
+    pub fn find_text(&mut self, query: &str) -> crate::terminal_find::Results {
+        crate::terminal_find::scan(self.parser.screen_mut(),query)
+    }
+
     /// Queue only intentional user input. Never send a parser response.
     pub fn send(&self, bytes: &[u8]) -> Result<(), String> {
         if self.state != State::Running {
