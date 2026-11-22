@@ -6,10 +6,10 @@ DrakOps keeps the computers you manage in one place and opens SSH connections to
 
 ## Downloads and walkthrough
 
-- [Windows x64: DrakOps 0.1.0-rc.2](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.2): unsigned portable ZIP, with Direct3D 12 and corrected theme restoration.
-- [Linux x86_64: DrakOps 0.1.0-rc.2 Linux.1](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.2-linux.1): the recommended shared archive requires glibc 2.39 or newer and OpenGL. Desktop-tested on Fedora 44 and Omarchy. The original Omarchy-only archive is still available.
+- [Windows x64: DrakOps 0.1.0 RC3](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.3): unsigned portable ZIP with Direct3D 12.
+- [Linux x86_64: DrakOps 0.1.0 RC3](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.3): shared archive, requires glibc 2.39 or newer and OpenGL.
 - [Watch the one-device walkthrough on YouTube](https://youtu.be/O0VCrI6YF0Q) · [Download MP4](https://github.com/drakahari/DrakOps/releases/download/v0.1.0-rc.1/DrakOps-0.1.0-rc.1-Walkthrough.mp4).
-- [macOS Apple Silicon: DrakOps 0.1.0-rc.2 macOS.1](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.2-macos.1): prerelease ZIP, ad-hoc signed and not Apple-notarized.
+- [macOS Apple Silicon: DrakOps 0.1.0 RC3](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.3): prerelease ZIP, ad-hoc signed and not Apple-notarized.
 
 ## Quick start: connect to one computer
 
