@@ -356,28 +356,80 @@ fn vt_color(color: vt100::Color, default: Color32, muted: Color32) -> Color32 {
     }
 }
 
+fn printable_input(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 4096 && !text.chars().any(char::is_control)
+}
+
 fn input(event: &egui::Event, app_cursor: bool) -> Option<Vec<u8>> {
+    use egui::Key::*;
     match event {
-        egui::Event::Text(s) if s.len() <= 4096 && !s.chars().any(char::is_control) => Some(s.as_bytes().to_vec()),
-        egui::Event::Key{key, pressed:true, modifiers, ..} if !modifiers.mac_cmd && !modifiers.alt => {
-            if modifiers.ctrl {
-                let n=match key {Key::A=>1,Key::B=>2,Key::C=>3,Key::D=>4,Key::E=>5,Key::F=>6,Key::G=>7,Key::H=>8,Key::I=>9,Key::J=>10,Key::K=>11,Key::L=>12,Key::N=>14,Key::O=>15,Key::P=>16,Key::Q=>17,Key::R=>18,Key::S=>19,Key::T=>20,Key::U=>21,Key::W=>23,Key::X=>24,Key::Y=>25,Key::Z=>26,_=>return None};
-                return Some(vec![n]);
-            }
-            let code = match key {
-                Key::Enter => "\r", Key::Backspace => "\x7f", Key::Tab => "\t", Key::Escape => "\x1b",
-                Key::ArrowUp => if app_cursor {"\x1bOA"} else {"\x1b[A"},
-                Key::ArrowDown => if app_cursor {"\x1bOB"} else {"\x1b[B"},
-                Key::ArrowRight => if app_cursor {"\x1bOC"} else {"\x1b[C"},
-                Key::ArrowLeft => if app_cursor {"\x1bOD"} else {"\x1b[D"},
-                Key::Home => "\x1b[H", Key::End => "\x1b[F",
-                Key::Delete => "\x1b[3~", Key::PageUp => "\x1b[5~", Key::PageDown => "\x1b[6~",
-                _ => return None,
+        egui::Event::Text(s) if printable_input(s) => Some(s.as_bytes().to_vec()),
+        egui::Event::Key { key, pressed: true, modifiers: m, .. } if !m.mac_cmd => {
+            // xterm modifier parameter: Shift=1, Alt=2, Ctrl=4, plus one.
+            let modifier = 1 + u8::from(m.shift) + 2*u8::from(m.alt) + 4*u8::from(m.ctrl);
+            let cursor = match key {
+                ArrowUp => Some('A'), ArrowDown => Some('B'), ArrowRight => Some('C'),
+                ArrowLeft => Some('D'), Home => Some('H'), End => Some('F'), _ => None,
             };
-            Some(code.as_bytes().to_vec())
+            if let Some(code) = cursor {
+                return Some(if modifier != 1 {format!("\x1b[1;{modifier}{code}")}
+                    else if app_cursor {format!("\x1bO{code}")} else {format!("\x1b[{code}")}.into_bytes());
+            }
+            let fn_code = match key { F1 => Some('P'), F2 => Some('Q'), F3 => Some('R'), F4 => Some('S'), _ => None };
+            if let Some(code) = fn_code {
+                return Some(if modifier == 1 {format!("\x1bO{code}")}
+                    else {format!("\x1b[1;{modifier}{code}")}.into_bytes());
+            }
+            let tilde_code = match key {
+                Insert => Some(2), Delete => Some(3), PageUp => Some(5), PageDown => Some(6),
+                F5 => Some(15), F6 => Some(17), F7 => Some(18), F8 => Some(19), F9 => Some(20),
+                F10 => Some(21), F11 => Some(23), F12 => Some(24), _ => None,
+            };
+            if let Some(code) = tilde_code {
+                // Do not reinterpret common clipboard chords if a frontend
+                // emits raw keys instead of native clipboard events.
+                if !m.alt && ((*key == Insert && (m.shift || m.ctrl)) || (*key == Delete && m.shift && !m.ctrl)) {
+                    return None;
+                }
+                return Some(if modifier == 1 {format!("\x1b[{code}~")}
+                    else {format!("\x1b[{code};{modifier}~")}.into_bytes());
+            }
+            if *key == Tab && m.shift && !m.ctrl && !m.alt { return Some(b"\x1b[Z".to_vec()); }
+            let mut bytes = if m.ctrl {
+                // Keep the platform's paste chord out of the terminal's raw keys.
+                let n = match key {
+                    A=>1,B=>2,C=>3,D=>4,E=>5,F=>6,G=>7,H=>8,I=>9,J=>10,K=>11,L=>12,M=>13,
+                    N=>14,O=>15,P=>16,Q=>17,R=>18,S=>19,T=>20,U=>21,W=>23,X=>24,Y=>25,Z=>26,
+                    Space|Num2=>0,OpenBracket=>27,Backslash=>28,CloseBracket=>29,
+                    Num6=>30,Minus=>31,Backspace=>8, _=>return None,
+                };
+                // Ctrl+Alt plus a printable key is ambiguous with AltGr.
+                if m.alt && *key != Backspace { return None; }
+                vec![n]
+            } else {
+                vec![match key {
+                    Enter=>13, Backspace=>127, Tab=>9, Escape=>27, _=>return None,
+                }]
+            };
+            if m.alt { bytes.insert(0, 27); }
+            Some(bytes)
         }
         _ => None,
     }
+}
+
+fn alt_printable(key: Key, shift: bool) -> Option<u8> {
+    // Fallback when the OS delivers an Alt chord but no corresponding Text.
+    // Only use layout-level letter/Space keys; punctuation and composed text
+    // require a native Text event to avoid guessing a keyboard layout.
+    use egui::Key::*;
+    let byte = match key {
+        A=>b'a',B=>b'b',C=>b'c',D=>b'd',E=>b'e',F=>b'f',G=>b'g',H=>b'h',I=>b'i',
+        J=>b'j',K=>b'k',L=>b'l',M=>b'm',N=>b'n',O=>b'o',P=>b'p',Q=>b'q',R=>b'r',
+        S=>b's',T=>b't',U=>b'u',V=>b'v',W=>b'w',X=>b'x',Y=>b'y',Z=>b'z',Space=>b' ',
+        _=>return None,
+    };
+    Some(if shift {byte.to_ascii_uppercase()} else {byte})
 }
 
 fn render(ui: &mut egui::Ui, terminal: &vt100::Screen, focused: bool, row_height: f32) {
@@ -428,7 +480,24 @@ struct TerminalInput {
 fn input_batch(events:&mut Vec<egui::Event>,app_cursor:bool,mac:bool)->TerminalInput{
     let mut result=TerminalInput::default();
     let mut ambiguous=false;
+    let mut pending_alt: Option<Option<u8>>=None;
+    let append=|result:&mut TerminalInput, bytes:&[u8]| {
+        if result.bytes.len()+bytes.len()<=PASTE_LIMIT {result.bytes.extend_from_slice(bytes);}
+    };
     events.retain(|e|{
+        if let Some(fallback)=pending_alt.take() {
+            if let egui::Event::Text(s)=e && printable_input(s) {
+                // Linux/Windows Meta prefixes ASCII, while macOS Option may
+                // compose a character. Keep native Unicode text as one unit.
+                let prefix=!mac && s.is_ascii();
+                if result.bytes.len()+usize::from(prefix)+s.len()<=PASTE_LIMIT {
+                    if prefix {result.bytes.push(27);}
+                    result.bytes.extend_from_slice(s.as_bytes());
+                }
+                return false;
+            }
+            if !mac && let Some(byte)=fallback {append(&mut result,&[27,byte]);}
+        }
         match e {
             // Non-Mac native clipboard events erase the original chord.
             egui::Event::Paste(_) if !mac=>{ambiguous=true;return false;}
@@ -447,10 +516,16 @@ fn input_batch(events:&mut Vec<egui::Event>,app_cursor:bool,mac:bool)->TerminalI
             }
             _=>{}
         }
+        if let egui::Event::Key{key,pressed:true,modifiers:m,..}=e
+            && m.alt && !m.ctrl && !m.mac_cmd && input(e,app_cursor).is_none() {
+            pending_alt=Some(alt_printable(*key,m.shift));
+            return false;
+        }
         let Some(part)=input(e,app_cursor) else{return true;};
-        if result.bytes.len()+part.len()<=PASTE_LIMIT {result.bytes.extend(part);}
+        append(&mut result,&part);
         false
     });
+    if !mac && let Some(Some(byte))=pending_alt {append(&mut result,&[27,byte]);}
     // Native and synthesized shortcut can be delivered together. Prefer the
     // single native payload; never combine it with keystrokes (such as Enter).
     if ambiguous {return TerminalInput::default();}
@@ -503,7 +578,8 @@ fn keyboard(ui: &mut egui::Ui, hit: &egui::Response, requested: bool, running: b
         let inside = at.filter(|pos| p.primary_clicked() && hit.rect.contains(*pos));
         (i.focused && !i.events.iter().any(|e|matches!(e,egui::Event::WindowFocused(false))), inside, p.any_pressed() && at.is_some_and(|pos| !hit.rect.contains(pos)),
           p.is_decidedly_dragging() && p.press_origin().is_some_and(|pos| hit.rect.contains(pos)),
-          i.key_pressed(Key::Escape) && i.modifiers.ctrl)
+          i.events.iter().any(|e|matches!(e,egui::Event::Key{
+              key:Key::Escape,pressed:true,modifiers,..} if modifiers.ctrl)))
     });
     if !focused || !running || release || dragging {
         *captured = false;
@@ -1034,6 +1110,41 @@ mod tests {
         assert_eq!(input(&key(Key::PageDown,Modifiers::NONE),true),Some(b"\x1b[6~".to_vec()));
     }
     #[test]
+    fn xterm_navigation_function_and_modified_keys() {
+        let key=|key,modifiers|egui::Event::Key{key,physical_key:None,pressed:true,repeat:false,modifiers};
+        for (k,m,application,expected) in [
+            (Key::Home,Modifiers::NONE,true,b"\x1bOH".as_slice()),
+            (Key::End,Modifiers::NONE,false,b"\x1b[F"),
+            (Key::F2,Modifiers::NONE,false,b"\x1bOQ"),
+            (Key::F10,Modifiers::SHIFT,false,b"\x1b[21;2~"),
+            (Key::ArrowRight,Modifiers::CTRL,true,b"\x1b[1;5C"),
+            (Key::PageUp,Modifiers::ALT,true,b"\x1b[5;3~"),
+            (Key::Tab,Modifiers::SHIFT,false,b"\x1b[Z"),
+            (Key::F,Modifiers::CTRL,false,b"\x06"),
+        ] {
+            assert_eq!(input(&key(k,m),application).as_deref(),Some(expected));
+        }
+        assert!(input(&key(Key::Insert,Modifiers::SHIFT),false).is_none());
+        assert!(input(&key(Key::Insert,Modifiers::CTRL),false).is_none());
+        assert!(input(&key(Key::Delete,Modifiers::SHIFT),false).is_none());
+        assert!(input(&key(Key::V,Modifiers::CTRL),false).is_none());
+        assert!(input(&key(Key::F,Modifiers::MAC_CMD),false).is_none());
+    }
+
+    #[test]
+    fn alt_meta_is_not_duplicated_with_text_and_option_unicode_stays_literal() {
+        let alt=|key|egui::Event::Key{key,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::ALT};
+        let mut events=vec![alt(Key::B),egui::Event::Text("b".into())];
+        assert_eq!(input_batch(&mut events,false,false).bytes,b"\x1bb");
+        let mut events=vec![alt(Key::B)];
+        assert_eq!(input_batch(&mut events,false,false).bytes,b"\x1bb");
+        let mut events=vec![alt(Key::B),egui::Event::Text("∫".into())];
+        assert_eq!(input_batch(&mut events,false,true).bytes,"∫".as_bytes());
+        let mut events=vec![alt(Key::V),egui::Event::Paste("do not forward".into()),egui::Event::Text("x".into())];
+        assert!(input_batch(&mut events,false,false).bytes.is_empty());
+    }
+
+    #[test]
     fn gui_body_click_or_explicit_f2_arms_keyboard_and_outside_stops_capture() {
         let ctx=egui::Context::default();
         let mut captured=false;
@@ -1076,6 +1187,13 @@ mod tests {
         let f2=egui::Event::Key{key:Key::F2,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::NONE};
         let enabled=frame(vec![f2,egui::Event::Text("discard activation batch".into())]);
         assert!(enabled.1 && enabled.2.is_empty());
+        let release=egui::Event::Key{key:Key::Escape,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::CTRL};
+        // RawInput modifiers are already released; the Key's own Ctrl state
+        // must still end capture and discard the remainder of this batch.
+        let released=frame(vec![release,egui::Event::Text("discard release batch".into())]);
+        assert!(!released.1 && released.2.is_empty());
+        frame(vec![egui::Event::PointerMoved(target),button(target,true)]);
+        assert!(frame(vec![button(target,false)]).1);
         let regained=frame(vec![egui::Event::WindowFocused(false),egui::Event::WindowFocused(true),egui::Event::Text("discard focus churn".into())]);
         assert!(!regained.1 && regained.2.is_empty());
     }

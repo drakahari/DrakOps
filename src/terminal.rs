@@ -144,6 +144,10 @@ impl Session {
         })
     }
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        // Preserve visible output after a session exits or starts disconnecting.
+        // vt100 truncates rows on shrink, and there is no longer a live application
+        // that can redraw a closed terminal.
+        if !matches!(self.state, State::Starting | State::Running) { return Ok(()); }
         let (rows, cols) = dimensions(rows, cols);
         if self.parser.screen().size() != (rows, cols) {
             self.parser.screen_mut().set_size(rows, cols);
@@ -403,6 +407,21 @@ pub(crate) mod tests {
         io::stdout().flush().unwrap();
         let mut line = String::new();
         io::stdin().read_line(&mut line).unwrap();
+        #[cfg(unix)]
+        if line.trim_end() == "check-size" {
+            let deadline=Instant::now()+Duration::from_secs(3);
+            loop {
+                // Query the child terminal's actual size, not the parser model.
+                let mut dims:libc::winsize=unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::ioctl(libc::STDIN_FILENO,libc::TIOCGWINSZ,&mut dims) },0);
+                if (dims.ws_row,dims.ws_col)==(31,101) {
+                    println!("[fixture-size:31x101]");
+                    break;
+                }
+                assert!(Instant::now()<deadline,"PTY did not receive its new dimensions");
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
         println!("[fixture-got:{}]", line.trim_end());
         io::stdout().flush().unwrap();
         if line.trim() == "wait" { let _ = io::stdin().read_line(&mut line); }
@@ -422,6 +441,19 @@ pub(crate) mod tests {
         }
         panic!("fixture did not reach expected state ({:?}), screen: {:?}", session.state(), session.screen().contents());
     }
+    #[cfg(unix)]
+    #[test]
+    fn child_gets_resized_pty_and_finished_output_is_preserved() {
+        let mut s=fixture();
+        until(&mut s,|s|s.state()==&State::Running && s.screen().contents().contains("[fixture-ready]"));
+        s.resize(31,101).unwrap();
+        s.send(b"check-size\r").unwrap();
+        until(&mut s,|s|s.state()==&State::Exited(0) && s.screen().contents().contains("[fixture-size:31x101]"));
+        s.resize(4,20).unwrap();
+        assert_eq!(s.screen().size(),(31,101));
+        assert!(s.screen().contents().contains("[fixture-size:31x101]"));
+    }
+
     #[test]
     fn pty_roundtrip_resize_natural_exit_and_disconnect() {
         let mut s = fixture();
