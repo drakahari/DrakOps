@@ -1,6 +1,6 @@
 [package]
 name = "homeops"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 edition = "2024"
 publish = false
 
@@ -34,3 +34,4 @@ wgpu = { version = "=27.0.1", default-features = false, features = ["dx12"] }
 portable-pty = { path = "vendor/portable-pty" }
 
 eframe = { path = "vendor/eframe" }
+objc2-foundation = { path = "vendor/objc2-foundation-0.2.2" }
