@@ -166,6 +166,28 @@ pub(crate) fn open_regular(path: &Path) -> std::io::Result<fs::File> {
     Ok(file)
 }
 
+struct InventoryLock(fs::File);
+
+impl InventoryLock {
+    fn acquire(file: fs::File) -> Result<Self, SaveError> {
+        match fs::File::try_lock(&file) {
+            Ok(()) => Ok(Self(file)),
+            Err(fs::TryLockError::WouldBlock) => Err(SaveError::Busy),
+            Err(fs::TryLockError::Error(e)) => Err(SaveError::Storage(err(e))),
+        }
+    }
+}
+
+impl Drop for InventoryLock {
+    fn drop(&mut self) {
+        // A concurrently forked child may briefly inherit the same open file
+        // description before exec. Explicitly unlock rather than waiting for
+        // its last descriptor to close. The File still closes on every path.
+        // An unlock error must not turn an already-persisted save into a failure.
+        let _ = fs::File::unlock(&self.0);
+    }
+}
+
 fn inventory_bytes(path: &Path) -> Result<Revision, String> {
     match open_regular(path) {
         Ok(file) => bounded(file, 8 * 1024 * 1024).map(|bytes| Revision(Some(bytes))),
@@ -225,11 +247,7 @@ impl Book {
         nonblocking_option(&mut options);
         let lock=options.open(lock_path).map_err(storage)?;
         require_regular(lock.metadata().map_err(storage)?).map_err(storage)?;
-        match lock.try_lock() {
-            Ok(()) => (),
-            Err(fs::TryLockError::WouldBlock) => return Err(SaveError::Busy),
-            Err(fs::TryLockError::Error(e)) => return Err(storage(e)),
-        }
+        let _lock=InventoryLock::acquire(lock)?;
         if inventory_bytes(path).map_err(SaveError::Storage)? != *expected {
             return Err(SaveError::Conflict);
         }
@@ -237,7 +255,6 @@ impl Book {
         f.write_all(&bytes).map_err(storage)?;
         f.as_file().sync_all().map_err(storage)?;
         f.persist(path).map_err(|e| storage(e.error))?;
-        drop(lock);
         Ok(Revision(Some(bytes)))
     }
 }
@@ -334,6 +351,23 @@ mod tests {
         assert!(matches!(loser.2, Err(SaveError::Busy | SaveError::Conflict)));
         assert!(matches!(loser.0.save(&p,&loser.1), Err(SaveError::Conflict)));
         assert_eq!(Book::read(&p).unwrap().0.theme,winner.0.theme);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_guard_unlocks_even_while_a_duplicate_descriptor_is_open() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("book.lock");
+        let open=||fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&path).unwrap();
+        let original=open();
+        let duplicate=original.try_clone().unwrap();
+        let held=InventoryLock::acquire(original).unwrap();
+        assert!(matches!(InventoryLock::acquire(open()),Err(SaveError::Busy)));
+        drop(held);
+        let next=InventoryLock::acquire(open()).expect("guard must unlock while the duplicate remains open");
+        drop(next);
+        drop(duplicate);
     }
 
     #[test]
