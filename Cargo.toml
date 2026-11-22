@@ -29,3 +29,5 @@ wgpu = { version = "=27.0.1", default-features = false, features = ["dx12"] }
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
+
+objc2-foundation = { path = "vendor/objc2-foundation-0.2.2" }

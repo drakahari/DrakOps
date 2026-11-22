@@ -1,0 +1,15 @@
+DrakOps v0.1.0-rc.2, macos.1
+Base source commit b0b9cc55ccf7c34094b735453952c3e7a8a96a5e.
+Build from the matching source archive's Mac Foundation backport and lockfile.
+Rust toolchain 1.100.0; target aarch64-apple-darwin; Apple CLI SDK 26.2.
+Cargo: cargo build --release --locked --offline.
+Set RUSTFLAGS (in this order):
+  --remap-path-prefix=<build home>=/build
+  --remap-path-prefix=<CARGO_HOME>=/build/cargo
+  --remap-path-prefix=<RUSTUP_HOME>=/build/rustup
+  --remap-path-prefix=<CARGO_TARGET_DIR>=/build/target
+  --remap-path-prefix=<source checkout>=/build/drakops
+The reviewed source passed 53 Apple Silicon tests and a separate native
+main-queue return/panic proof. This remapped build received a focused,
+synthetic launch check from the extracted ad-hoc signed app. That smoke
+did not use live SSH, a real clipboard, or the native picker.
