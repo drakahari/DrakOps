@@ -6,10 +6,10 @@ DrakOps keeps the computers you manage in one place and opens SSH connections to
 
 ## Downloads and walkthrough
 
-- [Windows x64: DrakOps 0.1.0 RC3](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.3): unsigned portable ZIP with Direct3D 12.
-- [Linux x86_64: DrakOps 0.1.0 RC3](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.3): shared archive, requires glibc 2.39 or newer and OpenGL.
+- [Windows x64: DrakOps 0.1.0 RC4](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.4): unsigned portable ZIP with Direct3D 12.
+- [Linux x86_64: DrakOps 0.1.0 RC4](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.4): shared archive, requires glibc 2.39 or newer and OpenGL.
 - [Watch the one-device walkthrough on YouTube](https://youtu.be/O0VCrI6YF0Q) · [Download MP4](https://github.com/drakahari/DrakOps/releases/download/v0.1.0-rc.1/DrakOps-0.1.0-rc.1-Walkthrough.mp4).
-- [macOS Apple Silicon: DrakOps 0.1.0 RC3](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.3): prerelease ZIP, ad-hoc signed and not Apple-notarized.
+- [macOS Apple Silicon: DrakOps 0.1.0 RC4](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.4): prerelease ZIP, ad-hoc signed and not Apple-notarized.
 
 ## Quick start: connect to one computer
 
