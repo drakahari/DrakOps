@@ -336,16 +336,41 @@ mod tests {
         assert_eq!(Book::read(&p).unwrap().0.theme,winner.0.theme);
     }
 
-    #[test] fn held_sidecar_lock_is_a_nonblocking_retry() {
+    #[test]
+    #[ignore = "helper invoked by sidecar_lock_prevents_other_process_from_saving"]
+    fn sidecar_lock_child() {
+        let Some(path)=std::env::var_os("DRAKOPS_TEST_SIDECAR") else {return;};
+        let lock=fs::OpenOptions::new().read(true).write(true).create_new(true).open(path).unwrap();
+        lock.try_lock().unwrap();
+        println!("READY");
+        std::io::stdout().flush().unwrap();
+        let mut done=[0];
+        std::io::stdin().read_exact(&mut done).unwrap();
+    }
+
+    #[test] fn sidecar_lock_prevents_other_process_from_saving() {
+        use std::{io::{BufRead, BufReader},process::{Command, Stdio}};
         let dir=tempfile::tempdir().unwrap();
         let path=dir.path().join("book.json");
         let (book,revision)=Book::read(&path).unwrap();
-        let held=fs::OpenOptions::new().read(true).write(true).create_new(true)
-            .open(path.with_extension("lock")).unwrap();
-        held.try_lock().unwrap();
-        assert!(matches!(book.save(&path,&revision),Err(SaveError::Busy)));
+        let mut child=Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored","--exact","book::tests::sidecar_lock_child","--nocapture"])
+            .env("DRAKOPS_TEST_SIDECAR",path.with_extension("lock"))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut ready=false;
+        let mut stdout=BufReader::new(child.stdout.take().unwrap());
+        for line in (&mut stdout).lines() {
+            // libtest may print the helper's name in front of the readiness marker.
+            if line.unwrap().trim_end().ends_with("READY"){ready=true;break;}
+        }
+        let result=if ready { Some(book.save(&path,&revision)) } else { None };
+        let signal=child.stdin.take().unwrap().write_all(b"x");
+        let mut rest=String::new();
+        stdout.read_to_string(&mut rest).unwrap();
+        let status=child.wait().unwrap();
+        assert!(ready && signal.is_ok() && status.success());
+        assert!(matches!(result,Some(Err(SaveError::Busy))));
         assert!(!path.exists());
-        drop(held);
         book.save(&path,&revision).unwrap();
     }
 
