@@ -256,8 +256,11 @@ fn ssh_arguments(args: &[String]) -> Result<Vec<String>, String> {
         || (host.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
             && host.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))));
     if !username_ok || !address_ok { return Err(invalid()); }
+    // Keep normal SSH routing and identities, but do not inherit configured
+    // tunnels or X11 forwarding in a tab opened for interactive SSH.
     let mut options: Vec<String> = [
         "-tt", "-a", "-oStrictHostKeyChecking=yes", "-oUpdateHostKeys=no",
+        "-oClearAllForwardings=yes", "-oForwardX11=no",
         "-oPermitLocalCommand=no", "-oRemoteCommand=none",
         "-oControlPath=none", "-oControlMaster=no", "-oControlPersist=no",
     ].into_iter().map(str::to_owned).collect();
@@ -275,7 +278,8 @@ pub(crate) mod tests {
     fn pinned_destination_and_security_options() {
         let got = ssh_arguments(&strings(&["-l", "alex", "-p", "2222", "--", "2001:db8::2"])).unwrap();
         assert_eq!(&got[got.len()-6..], ["-p","2222","-l","alex","--","2001:db8::2"]);
-        for setting in ["-tt","-a","-oStrictHostKeyChecking=yes","-oUpdateHostKeys=no","-oRemoteCommand=none","-oControlPath=none"] {
+        for setting in ["-tt","-a","-oStrictHostKeyChecking=yes","-oUpdateHostKeys=no","-oRemoteCommand=none","-oControlPath=none",
+            "-oClearAllForwardings=yes","-oForwardX11=no"] {
             assert!(got.iter().any(|s| s == setting));
         }
     }
