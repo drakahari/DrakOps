@@ -6,7 +6,31 @@ use std::{sync::{Arc,atomic::{AtomicUsize,Ordering}},time::Duration};
 
 const MAX_TABS: usize = 8;
 const COPIED_SECONDS: f64 = 2.;
-const TERMINAL_ROW_HEIGHT: f32 = 16.;
+const DEFAULT_TERMINAL_FONT: u8 = 13;
+const MIN_TERMINAL_FONT: u8 = 10;
+const MAX_TERMINAL_FONT: u8 = 22;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TerminalFont(u8);
+impl Default for TerminalFont {
+    fn default() -> Self { Self(DEFAULT_TERMINAL_FONT) }
+}
+impl TerminalFont {
+    fn step(self, change: i8) -> Self {
+        Self(self.0.saturating_add_signed(change).clamp(MIN_TERMINAL_FONT, MAX_TERMINAL_FONT))
+    }
+    fn font_id(self) -> FontId { FontId::new(f32::from(self.0), FontFamily::Monospace) }
+    fn row_height(self) -> f32 { (f32::from(self.0) * 16. / f32::from(DEFAULT_TERMINAL_FONT)).ceil() }
+
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        if ui.add_enabled(self.0>MIN_TERMINAL_FONT,egui::Button::new("A−").small())
+            .on_hover_text("Smaller terminal text").clicked() { *self=self.step(-1); }
+        if ui.add_enabled(self.0<MAX_TERMINAL_FONT,egui::Button::new("A+").small())
+            .on_hover_text("Larger terminal text").clicked() { *self=self.step(1); }
+        if ui.add_enabled(*self!=Self::default(),egui::Button::new(format!("{} pt",self.0)).small())
+            .on_hover_text("Reset terminal text size").clicked() { *self=Self::default(); }
+    }
+}
 const HISTORY_BAR: f32 = 16.;
 
 #[derive(Default)]
@@ -15,8 +39,8 @@ struct ScrollGesture {
     thumb_grab: Option<f32>,
 }
 impl ScrollGesture {
-    fn wheel(&mut self, point_delta: f32, offset: usize, limit: usize) -> usize {
-        let exact = self.wheel_remainder + point_delta / TERMINAL_ROW_HEIGHT;
+    fn wheel(&mut self, point_delta: f32, offset: usize, limit: usize, row_height: f32) -> usize {
+        let exact = self.wheel_remainder + point_delta / row_height;
         let lines = exact.trunc() as isize;
         let next = offset.saturating_add_signed(lines).min(limit);
         self.wheel_remainder = if next == 0 && exact < 0. || next == limit && exact > 0. {
@@ -155,6 +179,7 @@ pub(super) struct TerminalUi {
     show: bool,
     capture: bool,
     copy_mode: bool,
+    terminal_font: TerminalFont,
     selection_stamp: Option<(usize,u64)>,
     drag_start: Option<egui::Pos2>,
     label_origin: bool,
@@ -432,9 +457,10 @@ fn alt_printable(key: Key, shift: bool) -> Option<u8> {
     Some(if shift {byte.to_ascii_uppercase()} else {byte})
 }
 
-fn render(ui: &mut egui::Ui, terminal: &vt100::Screen, focused: bool, row_height: f32) {
+fn render(ui: &mut egui::Ui, terminal: &vt100::Screen, focused: bool, sizing: TerminalFont) {
     let colors = theme::roles(ui.ctx());
-    let font = FontId::new(13.,FontFamily::Monospace);
+    let font = sizing.font_id();
+    let row_height=sizing.row_height();
     let (rows,cols) = terminal.size();
     let cursor = terminal.cursor_position();
     ui.spacing_mut().item_spacing.y = 0.;
@@ -456,6 +482,15 @@ fn render(ui: &mut egui::Ui, terminal: &vt100::Screen, focused: bool, row_height
         }
         ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend).selectable(true));
     }
+}
+
+// Use the parser's logical visible text, not the UI's physical row labels.
+// vt100 joins soft wraps and keeps real newlines. Its grid can no longer
+// recover wraps discarded by a previous terminal resize.
+fn logical_copy_text(screen: &vt100::Screen) -> String { screen.contents() }
+
+fn selected_logical_copy(contents: &str, range: std::ops::Range<usize>) -> String {
+    contents.chars().skip(range.start).take(range.len()).collect()
 }
 
 const PASTE_LIMIT: usize = 4096;
@@ -693,6 +728,7 @@ impl TerminalUi {
                 let (mut offset, limit)=t.session.as_mut().map(Session::scrollback).unwrap_or_default();
                 let alternate=t.session.as_ref().is_some_and(|s|s.screen().alternate_screen());
                 let page_rows=t.session.as_ref().map_or(1,|s|s.screen().size().0.saturating_sub(1).max(1)) as isize;
+                let previous_font=deck.terminal_font;
                 ui.horizontal_wrapped(|ui| {
                     ui.strong("SSH terminal");
                     ui.label(RichText::new(&t.target).monospace());
@@ -709,15 +745,18 @@ impl TerminalUi {
                             .on_disabled_hover_text(if alternate {"History paused in full-screen programs."} else {"Showing live terminal output."})
                             .clicked();
                     }
+                    if t.session.is_some() || t.demo.is_some() { deck.terminal_font.controls(ui); }
                     if t.demo.is_some(){ui.weak("Read-only sample. No SSH connection.");}
                     if t.session.as_ref().is_some_and(|s| matches!(s.state(),terminal::State::Running)) {
                         paste_click=ui.add_enabled(!t.find.open,egui::Button::new("Paste").small())
                             .on_hover_text("Review one line locally before sending").clicked();
-                        if ui.add_enabled(!t.find.open,egui::Button::new(if deck.copy_mode {"Back to terminal"}else{"Select text"}).small()).clicked(){
-                            deck.copy_mode=!deck.copy_mode;deck.capture=false;deck.drag_start=None;
-                        }
-                        if deck.copy_mode {copy_click=ui.add_enabled(!t.find.open,egui::Button::new("Copy selection").small()).clicked();}
                         ui.weak(if deck.capture {"Keyboard active | Ctrl+Esc to release"} else {"Click terminal to type | Drag to select | Tab then F2 for keyboard"});
+                    }
+                    if t.session.is_some() {
+                        if ui.add_enabled(!t.find.open,egui::Button::new(if deck.copy_mode {"Back to terminal"}else{"Select text"}).small())
+                            .on_hover_text("Select logical text: joins soft-wrapped rows and preserves real line breaks")
+                            .clicked(){deck.copy_mode=!deck.copy_mode;deck.capture=false;deck.drag_start=None;}
+                        if deck.copy_mode {copy_click=ui.add_enabled(!t.find.open,egui::Button::new("Copy selection").small()).clicked();}
                     }
                     if let Some(s)=&t.session && matches!(s.state(),terminal::State::Running) &&
                         !find_click && ui.add_enabled(!t.find.open,egui::Button::new("Send Ctrl+C")).clicked(){
@@ -728,6 +767,17 @@ impl TerminalUi {
                     if ui.button("Collapse").clicked(){deck.show=false;deck.capture=false;}
                     if t.session.is_some(){copied_badge(ui,t.copied_until);}
                 });
+                let sizing=deck.terminal_font;
+                let row_height=sizing.row_height();
+                if sizing!=previous_font {
+                    t.scroll.wheel_remainder=0.;
+                    t.find.changed();
+                    deck.capture=false;
+                    deck.drag_start=None;
+                    deck.label_origin=false;
+                    deck.deferred_copy.clear();
+                    ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().clear_selection();
+                }
                 let close_tab=close_requested==Some(deck.selected);
                 if !t.error.is_empty(){ui.colored_label(theme::roles(ctx).error,&t.error);}
                 let failed=t.session.as_ref().is_some_and(|s|matches!(s.state(),terminal::State::Failed(_) | terminal::State::Exited(1..)))
@@ -753,14 +803,14 @@ impl TerminalUi {
                 let h=ui.available_height().max(28.);
                 let width=ui.available_width();
                 let inner_height=(h-12.).max(12.);
-                let dims=(inner_height / TERMINAL_ROW_HEIGHT).floor().clamp(2., f32::from(terminal::MAX_ROWS)) as u16;
+                let dims=(inner_height / row_height).floor().clamp(2., f32::from(terminal::MAX_ROWS)) as u16;
                 // Resizing a finished vt100 screen truncates its bottom rows.
                 // Keep that screen intact and let egui scroll just its viewport.
                 let render_rows=t.session.as_ref().map_or(dims,|s|{
                     if s.state().is_active() {dims} else {s.screen().size().0}
                 });
-                let overflow=f32::from(render_rows)*TERMINAL_ROW_HEIGHT>inner_height;
-                let cw=ui.fonts_mut(|f|f.glyph_width(&FontId::new(13.,FontFamily::Monospace),'M')).max(1.);
+                let overflow=f32::from(render_rows)*row_height>inner_height;
+                let cw=ui.fonts_mut(|f|f.glyph_width(&sizing.font_id(),'M')).max(1.);
                 // Keep terminal dimensions stable when the first line enters history or a pager opens.
                 let history_width=if t.session.is_some() { HISTORY_BAR } else { 0. };
                 let cols=((width - 16. - history_width) / cw).floor().clamp(2., f32::from(terminal::MAX_COLS)) as u16;
@@ -848,7 +898,7 @@ impl TerminalUi {
                     t.scroll.wheel_remainder=0.;
                     t.find.changed();
                 } else if wheel != 0. {
-                    offset=t.scroll.wheel(wheel,offset,limit);
+                    offset=t.scroll.wheel(wheel,offset,limit,row_height);
                     t.find.changed();
                 }
                 let mut bar_active=false;
@@ -916,25 +966,25 @@ impl TerminalUi {
                         .auto_shrink([false,false]).max_height(inner_height)
                         .stick_to_bottom(overflow && !deck.copy_mode && offset==0);
                     if overflow {
-                        if jump_live {viewport=viewport.vertical_scroll_offset(f32::from(render_rows)*TERMINAL_ROW_HEIGHT);}
+                        if jump_live {viewport=viewport.vertical_scroll_offset(f32::from(render_rows)*row_height);}
                         else if navigating && offset>0 {viewport=viewport.vertical_scroll_offset(0.);}
                     }
                     viewport.show(ui,|ui| {
                         if let Some(s)=&t.session{
                             if deck.copy_mode {
                                 use std::hash::{Hash,Hasher};
-                                let contents=s.screen().contents();
+                                let contents=logical_copy_text(s.screen());
                                 let mut stamp=std::hash::DefaultHasher::new();
                                 contents.hash(&mut stamp);
                                 let mut text=contents.as_str();
-                                ui.weak("Select visible text to copy. No keystrokes go to SSH in this view.");
+                                ui.weak("Select to copy. Soft wraps are joined; real line breaks are kept. No keys go to SSH in this view.");
                                 observe_copy(ctx,&mut t.copied_until, ||{
-                                    let output=egui::TextEdit::multiline(&mut text).font(egui::TextStyle::Monospace)
-                                        .id_salt(("terminal-copy",tab_id,stamp.finish())).show(ui);
+                                    let output=egui::TextEdit::multiline(&mut text).font(sizing.font_id())
+                                        .id_salt(("terminal-copy",tab_id,sizing.0,stamp.finish())).show(ui);
                                     let range=output.cursor_range.or_else(||egui::TextEdit::load_state(ctx,output.response.id).and_then(|s|s.cursor.char_range()));
                                     if copy_click && let Some(range)=range.filter(|r|!r.is_empty()){
                                         let range=range.as_sorted_char_range();
-                                        ctx.copy_text(contents.chars().skip(range.start).take(range.len()).collect::<String>());
+                                        ctx.copy_text(selected_logical_copy(&contents,range));
                                     }
                                 });
                             }else{
@@ -956,10 +1006,10 @@ impl TerminalUi {
                                 if (copy || selected) && !blocked && deck.show && !switched && !close_tab && !deck.close_app {
                                     deck.deferred_copy.arm_this_pass=true;
                                 }
-                                scoped_copy(ui,copy,|ui|render(ui,s.screen(),has_focus && offset==0,TERMINAL_ROW_HEIGHT));
+                                scoped_copy(ui,copy,|ui|render(ui,s.screen(),has_focus && offset==0,sizing));
                             }
                         }
-                        if let Some(parser)=&t.demo{render(ui,parser.screen(),false,16.);}
+                        if let Some(parser)=&t.demo{render(ui,parser.screen(),false,sizing);}
                     });
                 });
                 });
@@ -973,16 +1023,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_font_has_bounded_steps_and_consistent_line_metrics() {
+        let default=TerminalFont::default();
+        assert_eq!(default.font_id().size,13.);
+        assert_eq!(default.row_height(),16.);
+        let smaller=default.step(i8::MIN);
+        let larger=default.step(i8::MAX);
+        assert_eq!(smaller.font_id().size,10.);
+        assert_eq!(larger.font_id().size,22.);
+        assert!(smaller.row_height()<default.row_height());
+        assert!(larger.row_height()>default.row_height());
+        assert_eq!(ScrollGesture::default().wheel(larger.row_height(),0,50,larger.row_height()),1);
+    }
+
+    #[test]
+    fn logical_copy_preserves_soft_wrap_hard_newlines_and_unicode() {
+        let mut parser=vt100::Parser::new(5,5,0);
+        parser.process("ab界cdef\r\nlast".as_bytes());
+        let text=logical_copy_text(parser.screen());
+        assert_eq!(text,"ab界cdef\nlast");
+        assert_eq!(selected_logical_copy(&text,2..9),"界cdef\nl");
+    }
+
+    #[test]
     fn wheel_accumulates_small_deltas_and_history_gestures_are_tab_local() {
         let mut one=ScrollGesture::default();
         let mut two=ScrollGesture::default();
-        assert_eq!(one.wheel(8.,0,50),0);
-        assert_eq!(two.wheel(8.,0,50),0);
-        assert_eq!(one.wheel(24.,0,50),2);
-        assert_eq!(two.wheel(8.,0,50),1);
-        assert_eq!(one.wheel(999.,49,50),50);
-        assert_eq!(one.wheel(-16.,50,50),49);
-        assert_eq!(one.wheel(-999.,49,50),0);
+        assert_eq!(one.wheel(8.,0,50,16.),0);
+        assert_eq!(two.wheel(8.,0,50,16.),0);
+        assert_eq!(one.wheel(24.,0,50,16.),2);
+        assert_eq!(two.wheel(8.,0,50,16.),1);
+        assert_eq!(one.wheel(999.,49,50,16.),50);
+        assert_eq!(one.wheel(-16.,50,50,16.),49);
+        assert_eq!(one.wheel(-999.,49,50,16.),0);
     }
 
     #[test]
@@ -1217,7 +1290,7 @@ mod tests {
                         origin=bounds.min;
                         let copy=copy_gesture(ui,bounds,enabled,&mut tracked);
                         relay.arm_this_pass=copy;
-                        scoped_copy(ui,copy,|ui|render(ui,vt.screen(),false,16.));
+                        scoped_copy(ui,copy,|ui|render(ui,vt.screen(),false,TerminalFont::default()));
                     });
                     relay.finish(ctx,0);
                 });
@@ -1305,7 +1378,7 @@ mod tests {
             let output=ctx.run(raw,|ctx| {
                 egui::CentralPanel::default().show(ctx,|ui|{
                     origin=ui.cursor().min;
-                    render(ui,vt.screen(),false,16.);
+                    render(ui,vt.screen(),false,TerminalFont::default());
                 });
             });
             (origin,output.platform_output.commands)
