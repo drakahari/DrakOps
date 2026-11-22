@@ -117,6 +117,35 @@ pub struct Book { pub version: u8, pub theme: String, #[serde(default)] pub copy
 impl Default for Book {
     fn default() -> Self { Self { version: 1, theme: "lab-navy".into(), copy_on_select: false, devices: Vec::new() } }
 }
+/// Exact file bytes (or absence) observed by this instance, until its next successful save.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Revision(Option<Vec<u8>>);
+
+#[derive(Debug)]
+pub enum SaveError {
+    Busy,
+    Conflict,
+    Storage(String),
+}
+
+impl std::fmt::Display for SaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("Another DrakOps window is saving. Nothing was overwritten. Try again in a moment."),
+            Self::Conflict => f.write_str("The saved inventory changed in another window. Nothing was overwritten. Reload the saved inventory before retrying."),
+            Self::Storage(message) => f.write_str(message),
+        }
+    }
+}
+
+fn inventory_bytes(path: &Path) -> Result<Revision, String> {
+    match fs::File::open(path) {
+        Ok(file) => bounded(file, 8 * 1024 * 1024).map(|bytes| Revision(Some(bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Revision(None)),
+        Err(e) => Err(err(e)),
+    }
+}
+
 impl Book {
     pub fn remove_reviewed(&mut self, expected:&Device) -> Result<(usize,Device),String> {
         let i=self.devices.iter().position(|d|d==expected)
@@ -131,13 +160,10 @@ impl Book {
         self.devices.insert(index.min(self.devices.len()),device);
         Ok(())
     }
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let s = match fs::File::open(path) {
-            Ok(source) => bounded(source, 8 * 1024 * 1024)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(e) => return Err(e.to_string()),
-        };
-        let b: Self = serde_json::from_slice(&s).map_err(err)?;
+    pub fn read(path: &Path) -> Result<(Self, Revision), String> {
+        let revision = inventory_bytes(path)?;
+        let Some(bytes) = &revision.0 else { return Ok((Self::default(), revision)); };
+        let b: Self = serde_json::from_slice(bytes).map_err(err)?;
         if b.version != 1 { return Err("This inventory was written by a different version of DrakOps.".into()); }
         if b.devices.len() > 5000 { return Err("Inventory exceeds the device limit.".into()); }
         for (i,d) in b.devices.iter().enumerate() {
@@ -146,18 +172,36 @@ impl Book {
                 return Err("Duplicate alias in the inventory.".into());
             }
         }
-        Ok(b)
+        Ok((b, revision))
     }
-    pub fn save(&self, path: &Path) -> Result<(), String> {
-        let dir = path.parent().ok_or("Inventory directory is missing.")?;
-        fs::create_dir_all(dir).map_err(err)?;
-        let bytes = serde_json::to_vec_pretty(self).map_err(err)?;
-        if bytes.len() > 8 * 1024 * 1024 || self.devices.len() > 5000 { return Err("Inventory exceeds the size limit.".into()); }
-        let mut f = NamedTempFile::new_in(dir).map_err(err)?;
-        f.write_all(&bytes).map_err(err)?;
-        f.as_file().sync_all().map_err(err)?;
-        f.persist(path).map_err(err)?;
-        Ok(())
+    /// All writers must lock the stable sidecar, not the inventory inode which is replaced.
+    /// Cooperating processes cannot check the same old revision and both commit a write.
+    pub fn save(&self, path: &Path, expected: &Revision) -> Result<Revision, SaveError> {
+        let storage = |e: std::io::Error| SaveError::Storage(err(e));
+        let dir = path.parent().ok_or_else(|| SaveError::Storage("Inventory directory is missing.".into()))?;
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| SaveError::Storage(err(e)))?;
+        if bytes.len() > 8 * 1024 * 1024 || self.devices.len() > 5000 {
+            return Err(SaveError::Storage("Inventory exceeds the size limit.".into()));
+        }
+        fs::create_dir_all(dir).map_err(storage)?;
+        // Keep the sidecar on disk for the lifetime of the inventory; never unlink it at unlock.
+        let lock_path = path.with_extension("lock");
+        let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(lock_path).map_err(storage)?;
+        match lock.try_lock() {
+            Ok(()) => (),
+            Err(fs::TryLockError::WouldBlock) => return Err(SaveError::Busy),
+            Err(fs::TryLockError::Error(e)) => return Err(storage(e)),
+        }
+        if inventory_bytes(path).map_err(SaveError::Storage)? != *expected {
+            return Err(SaveError::Conflict);
+        }
+        let mut f = NamedTempFile::new_in(dir).map_err(storage)?;
+        f.write_all(&bytes).map_err(storage)?;
+        f.as_file().sync_all().map_err(storage)?;
+        f.persist(path).map_err(|e| storage(e.error))?;
+        drop(lock);
+        Ok(Revision(Some(bytes)))
     }
 }
 pub fn bounded<R: Read>(reader: R, limit: u64) -> Result<Vec<u8>,String> {
@@ -217,12 +261,55 @@ mod tests {
     }
     #[test] fn inventory_persistence() {
         let dir=tempfile::tempdir().unwrap();
-        let p=dir.path().join("book.json"); let mut b=Book::default();
-        b.save(&p).unwrap(); b.theme="dlms-light".into(); b.save(&p).unwrap();
-        assert_eq!(Book::read(&p).unwrap().theme,b.theme);
+        let p=dir.path().join("book.json");
+        let (mut b, revision)=Book::read(&p).unwrap();
+        let revision=b.save(&p,&revision).unwrap();
+        b.theme="dlms-light".into();
+        let revision=b.save(&p,&revision).unwrap();
+        assert_eq!(Book::read(&p).unwrap().0.theme,b.theme);
         let legacy:Book=serde_json::from_str(r#"{"version":1,"theme":"lab-navy","devices":[]}"#).unwrap();
         assert!(!legacy.copy_on_select);
-        b.copy_on_select=true;b.save(&p).unwrap();assert!(Book::read(&p).unwrap().copy_on_select);
+        b.copy_on_select=true;
+        b.save(&p,&revision).unwrap();
+        assert!(Book::read(&p).unwrap().0.copy_on_select);
+    }
 
+    #[test] fn concurrent_independent_inventory_saves_never_lose_winner() {
+        use std::sync::Barrier;
+        let dir=tempfile::tempdir().unwrap();
+        let p=dir.path().join("book.json");
+        let rendezvous=Barrier::new(2);
+        let write = |theme: &str| {
+            let (mut book,revision)=Book::read(&p).unwrap();
+            book.theme=theme.into();
+            rendezvous.wait();
+            let result=book.save(&p,&revision);
+            (book, revision, result)
+        };
+        let (left,right)=std::thread::scope(|scope| {
+            let left=scope.spawn(||write("left"));
+            let right=scope.spawn(||write("right"));
+            (left.join().unwrap(),right.join().unwrap())
+        });
+        assert_ne!(left.2.is_ok(), right.2.is_ok());
+        let (winner, loser)=if left.2.is_ok(){(left,right)}else{(right,left)};
+        assert!(matches!(loser.2, Err(SaveError::Busy | SaveError::Conflict)));
+        assert!(matches!(loser.0.save(&p,&loser.1), Err(SaveError::Conflict)));
+        assert_eq!(Book::read(&p).unwrap().0.theme,winner.0.theme);
+    }
+
+    #[test] fn external_change_is_never_overwritten_and_reload_can_save() {
+        let dir=tempfile::tempdir().unwrap();
+        let p=dir.path().join("book.json");
+        let (_,missing)=Book::read(&p).unwrap();
+        fs::write(&p,b"cannot parse").unwrap();
+        assert!(matches!(Book::default().save(&p,&missing), Err(SaveError::Conflict)));
+        assert_eq!(fs::read(&p).unwrap(),b"cannot parse");
+        fs::remove_file(&p).unwrap();
+        Book::default().save(&p,&missing).unwrap();
+        let (mut book, fresh)=Book::read(&p).unwrap();
+        book.theme="dlms-light".into();
+        book.save(&p,&fresh).unwrap();
+        assert_eq!(Book::read(&p).unwrap().0.theme,"dlms-light");
     }
 }

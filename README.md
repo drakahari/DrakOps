@@ -41,7 +41,7 @@ The file ending in **.pub** is the public key you may add to the intended server
 
 ## Build and test
 
-Use stable Rust and the native platform prerequisites for eframe/egui. Windows MSVC is supported by the dependency stack; the first FM-16 development build uses the official Windows GNU Rust toolchain, with its self-contained linker tools on PATH for the current shell only. On Linux, the default GUI has X11 and Wayland support and requires the native OpenGL/desktop runtime. On macOS, use the native Apple tools.
+Use current stable Rust and the native platform prerequisites for eframe/egui. Windows MSVC is supported by the dependency stack; the first FM-16 development build uses the official Windows GNU Rust toolchain, with its self-contained linker tools on PATH for the current shell only. On Linux, the default GUI has X11 and Wayland support and requires the native OpenGL/desktop runtime. On macOS, use the native Apple tools.
 
 ```text
 cargo test --locked
@@ -73,10 +73,12 @@ Theme renderer and palette source: [DLMS Learning Lab at 6b54e348](https://githu
 
 ### CSV Browse and terminal tabs
 
-In **Import CSV**, choose **Browse for CSV…** or enter a path manually. Selecting a file fills the path only. Use **Review CSV** before adding devices; canceling Browse leaves the path and review unchanged.
+In **Import CSV**, choose **Browse for CSV…** or enter a path manually. Selecting a file fills the path only. Use **Review CSV** to read the file without blocking the window and confirm each SSH username, address, and port before adding devices; canceling Browse leaves the path and review unchanged.
 
 **Connect** opens an embedded tab for the device and its selected endpoint. Selecting the same live user, host and port returns to the existing tab. Use the arrow on **Connect**, then **Open new SSH tab**, to start a separate session to that same endpoint. Other connections continue running. Check the active tab's displayed user, host, port and route before typing. Click the terminal to type after switching tabs. **Disconnect** stops the active connection; use **×** on any tab to close just that session. Up to eight tabs can be open, and closing DrakOps disconnects all embedded sessions. External terminals remain independent.
 
+
+If another DrakOps window changed the saved inventory, the app refuses to overwrite it. Choose **Reload saved inventory** and retry. Open drafts stay available; if the same device was edited elsewhere, review the newly saved values before starting a new edit. Do not run older versions against the same inventory at the same time: they do not participate in the newer save lock.
 
 ### Connection routes
 

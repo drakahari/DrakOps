@@ -1253,6 +1253,7 @@ dependencies = [
  "eframe",
  "egui-winit",
  "if-addrs",
+ "libc",
  "mdns-sd",
  "portable-pty",
  "raw-window-handle",

@@ -1,5 +1,6 @@
 #![cfg_attr(all(target_os="windows", not(debug_assertions)), windows_subsystem="windows")]
 mod book;
+mod csv_review;
 mod theme;
 mod discovery;
 mod lan_discovery;
@@ -9,22 +10,22 @@ mod terminal;
 mod terminal_ui;
 mod external_terminal;
 mod ssh_setup;
-use book::{Book, Device, DeviceKind, Route};
+use book::{Book, Device, DeviceKind, Revision, Route, SaveError};
 use eframe::egui::{self, ComboBox, RichText, ScrollArea, TextEdit};
-use std::{collections::BTreeMap, fs, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf};
 
 const TITLE: &str = "DrakOps | Home SysOps";
 const SUBTITLE: &str = "Home SysOps";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone)]
-struct Edit { original: Option<String>, device: Device, port: String }
+struct Edit { original: Option<Device>, device: Device, port: String }
 struct App {
     header_icon: Option<egui::TextureHandle>,
     show_about: bool,
-    book: Book, path: Option<PathBuf>, locked: bool, error: Option<String>, status: String,
+    book: Book, path: Option<PathBuf>, revision: Revision, inventory_conflict: bool, locked: bool, error: Option<String>, status: String,
     selected: Option<String>, query: String, routes: BTreeMap<String,(Route,String)>,
-    editor: Option<Edit>, show_import: bool, import_path: String, import_picker: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>, review: Option<Vec<Device>>,
+    editor: Option<Edit>, show_import: bool, import_path: String, import_picker: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>, review: Option<Vec<Device>>, csv_review: csv_review::CsvReview,
     lan: lan_review::LanState,
     terminal: terminal_ui::TerminalUi,
     setup: Option<ssh_setup::Setup>,
@@ -74,12 +75,12 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>, demo: bool) -> Self {
         let path = if demo { None } else {directories::ProjectDirs::from("net","HomeOps","HomeOps").map(|d|d.data_local_dir().join("device-book.json"))};
         let unreadable = !demo && path.is_none();
-        let (book, error) = if demo { (demo_book(),None) } else if let Some(p)=&path {
+        let (book, revision, error) = if demo { (demo_book(), Revision::default(), None) } else if let Some(p)=&path {
             match Book::read(p) {
-                Ok(b) => (b,None),
-                Err(e) => (Book::default(),Some(format!("Existing inventory could not be read and will not be overwritten: {e}"))),
+                Ok((book, revision)) => (book, revision, None),
+                Err(e) => (Book::default(),Revision::default(),Some(format!("Existing inventory could not be read and will not be overwritten: {e}"))),
             }
-        } else { (Book::default(),Some("Could not locate your operating system's data folder.".into())) };
+        } else { (Book::default(),Revision::default(),Some("Could not locate your operating system's data folder.".into())) };
         theme::apply(&cc.egui_ctx,&book.theme);
         let header_icon=eframe::icon_data::from_png_bytes(include_bytes!("../assets/brand/drakops.png")).ok()
             .map(|icon|cc.egui_ctx.load_texture(
@@ -94,9 +95,9 @@ impl App {
             header_icon,
             show_about:false,
             selected:book.devices.first().map(|d|d.alias.clone()), locked:unreadable||error.is_some(),
-            book,path,error,status:if demo { "Demonstration profile · not saved".into() } else { String::new() },
+            book,path,revision,inventory_conflict:false,error,status:if demo { "Demonstration profile · not saved".into() } else { String::new() },
             query:String::new(),routes:Default::default(),editor:None,
-            show_import:false,import_path,import_picker:None,review:None,
+            show_import:false,import_path,import_picker:None,review:None,csv_review:Default::default(),
             lan: Default::default(),
             terminal: Default::default(),
             setup: None,
@@ -115,8 +116,30 @@ impl App {
     }
     fn replace(&mut self, book: Book) -> Result<(),String> {
         if self.locked { return Err("Inventory is read-only until the data file is recovered.".into()); }
-        if let Some(p)=&self.path {book.save(p)?;}
+        if self.inventory_conflict { return Err(SaveError::Conflict.to_string()); }
+        if let Some(p)=&self.path {
+            match book.save(p,&self.revision) {
+                Ok(revision) => self.revision=revision,
+                Err(e) => {
+                    self.inventory_conflict=matches!(e,SaveError::Conflict);
+                    return Err(e.to_string());
+                }
+            }
+        }
         self.book=book; Ok(())
+    }
+    fn reload_inventory(&mut self, ctx:&egui::Context) -> Result<String,String> {
+        let path=self.path.as_ref().ok_or("No saved inventory is available.")?;
+        let (book,revision)=Book::read(path)?;
+        self.selected=self.selected.take().filter(|alias|book.devices.iter().any(|d|&d.alias==alias))
+            .or_else(||book.devices.first().map(|d|d.alias.clone()));
+        self.book=book;
+        self.revision=revision;
+        self.inventory_conflict=false;
+        self.routes.clear();
+        self.setup=None; // Recheck the endpoint against the current inventory before key setup.
+        theme::apply(ctx,&self.book.theme);
+        Ok("Saved inventory reloaded. Open drafts and CSV reviews are still available.".into())
     }
     fn apply_theme(&mut self, ctx:&egui::Context, id:String) {
         let mut b=self.book.clone();
@@ -124,7 +147,7 @@ impl App {
         let r=self.replace(b).map(|_| {theme::apply(ctx,&id); "Theme applied.".into()});
         self.report(r);
     }
-    fn open_editor(&mut self, device:Device, original:Option<String>) {
+    fn open_editor(&mut self, device:Device, original:Option<Device>) {
         self.editor=Some(Edit{port:device.port.to_string(),device,original});
     }
     fn sidebar(&mut self, context:&egui::Context) {
@@ -198,7 +221,7 @@ impl App {
                 let available=connection_routes(&d);
                 let mut route=connection_route(&self.routes,&d);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(!self.locked,egui::Button::new("Edit device").min_size(egui::vec2(88.,31.))).clicked() {self.open_editor(d.clone(),Some(d.alias.clone()));}
+                    if ui.add_enabled(!self.locked,egui::Button::new("Edit device").min_size(egui::vec2(88.,31.))).clicked() {self.open_editor(d.clone(),Some(d.clone()));}
                     let busy=self.terminal.refers_to(&d);
                     if ui.add_enabled(!self.locked && !busy,egui::Button::new("Remove device").min_size(egui::vec2(108.,31.)))
                         .on_disabled_hover_text("Disconnect this device's embedded SSH session before removing it.").clicked(){
@@ -305,7 +328,7 @@ impl App {
                     if self.selected.as_deref()==Some(&expected.alias){
                         self.selected=self.book.devices.get(removed.0.min(self.book.devices.len().saturating_sub(1))).map(|d|d.alias.clone());
                     }
-                    if self.editor.as_ref().is_some_and(|edit|edit.original.as_deref()==Some(&expected.alias)){self.editor=None;}
+                    if self.editor.as_ref().is_some_and(|edit|edit.original.as_ref().is_some_and(|original|original.alias==expected.alias)){self.editor=None;}
                     if self.setup.as_ref().is_some_and(|setup|setup.refers_to(&expected)){self.setup=None;}
                     self.terminal.forget_closed(&expected);
                     self.last_removed=Some(removed);
@@ -354,10 +377,14 @@ impl App {
             let result=(|| {
                 edit.device.port=edit.port.trim().parse().map_err(|_|"SSH port must be 1–65535.")?;
                 edit.device.validate()?;
-                if self.book.devices.iter().any(|d| Some(&d.alias)!=edit.original.as_ref() && d.alias.eq_ignore_ascii_case(&edit.device.alias)) { return Err("That alias already belongs to a device.".into()); }
+                if let Some(original)=&edit.original && !self.book.devices.contains(original) {
+                    return Err("This device changed while you were editing. Your draft is still open. Copy any edits you want to keep before starting a new edit.".into());
+                }
+                if self.book.devices.iter().any(|d| Some(d)!=edit.original.as_ref() && d.alias.eq_ignore_ascii_case(&edit.device.alias)) { return Err("That alias already belongs to a device.".into()); }
                 let mut b=self.book.clone();
                 let mut changed_destination=false;
-                if let Some(entry)=b.devices.iter_mut().find(|d|Some(&d.alias)==edit.original.as_ref()){
+                if let Some(original)=&edit.original {
+                    let entry=b.devices.iter_mut().find(|d|&**d==original).ok_or("The original device is no longer available.")?;
                     changed_destination=(&entry.alias,&entry.host,&entry.lan,&entry.tailscale,&entry.user,entry.port)!=
                         (&edit.device.alias,&edit.device.host,&edit.device.lan,&edit.device.tailscale,&edit.device.user,edit.device.port);
                     *entry=edit.device.clone();
@@ -366,7 +393,7 @@ impl App {
                 self.replace(b)?;
                 if let Some(old)=&edit.original {
                     if changed_destination {
-                        self.routes.remove(old);
+                        self.routes.remove(&old.alias);
                     }
                 }
                 self.selected=Some(edit.device.alias.clone());
@@ -380,41 +407,59 @@ impl App {
     fn import_window(&mut self, ctx:&egui::Context) {
         if let Some(picker)=&self.import_picker {
             match picker.try_recv() {
-                Ok(path)=>{ self.import_picker=None; if self.show_import && select_csv_path(&mut self.import_path,path){self.review=None;} }
+                Ok(path)=>{ self.import_picker=None; if self.show_import && select_csv_path(&mut self.import_path,path){self.review=None;self.csv_review.invalidate();} }
                 Err(std::sync::mpsc::TryRecvError::Empty)=>ctx.request_repaint_after(std::time::Duration::from_millis(80)),
                 Err(_)=>{self.import_picker=None; if self.show_import {self.report(Err("CSV file chooser unavailable. Enter the CSV path instead.".into()));}}
             }
         }
-        if !self.show_import {return;}
+        if !self.show_import {
+            self.csv_review.invalidate();
+            let _=self.csv_review.poll();
+            return;
+        }
         let mut open=true;let mut review=false;let mut apply=false;let mut browse=false;
         egui::Window::new("Import connect devices").open(&mut open).default_width(485.).show(ctx,|ui|{
             browse=ui.add_enabled(self.import_picker.is_none(),egui::Button::new("Browse for CSV…")).clicked();
             if self.import_picker.is_some(){ui.spinner();}
             ui.label("Or enter a CSV path:");
-            if ui.add(TextEdit::singleline(&mut self.import_path).desired_width(f32::INFINITY)).changed(){self.review=None;}
+            if ui.add(TextEdit::singleline(&mut self.import_path).desired_width(f32::INFINITY)).changed(){self.review=None;self.csv_review.invalidate();}
             ui.weak("Expected columns: alias,hostname,user,port. Existing aliases are not changed.");
-            review=ui.button("Review CSV").clicked();
+            review=ui.add_enabled(!self.csv_review.busy() && !self.import_path.trim().is_empty(),egui::Button::new("Review CSV")).clicked();
+            if self.csv_review.current(){
+                ui.horizontal(|ui|{
+                    ui.spinner();
+                    ui.weak("Reading the CSV without opening any connections.");
+                    if ui.button("Cancel CSV review").clicked(){self.csv_review.invalidate();}
+                });
+            }
+            else if self.csv_review.busy(){ui.weak("The previous CSV read is still finishing.");}
             if let Some(rows)=&self.review {
                 let duplicate=|row:&Device| self.book.devices.iter().any(|d|d.alias.eq_ignore_ascii_case(&row.alias));
                 let additions=rows.iter().filter(|r|!duplicate(r)).count();
                 ui.label(format!("{additions} new · {} existing skipped",rows.len()-additions));
                 ScrollArea::vertical().max_height(190.).show(ui,|ui|for row in rows {
-                    ui.label(format!("{} · {}:{}{}",row.alias,row.host,row.port,if duplicate(row) {" (already exists)"}else{""}));
+                    ui.label(format!("{} · {}{}",row.alias,endpoint(row,Route::Saved),if duplicate(row) {" (already exists)"}else{""}));
                 });
                 apply=ui.add_enabled(additions>0,egui::Button::new("Add new devices")).clicked();
             }
             if let Some(e)=&self.error {ui.colored_label(theme::roles(ctx).error,e);}
         });
         self.show_import=open;
-        if !open {self.import_picker=None;}
+        if !open {
+            self.import_picker=None;
+            self.csv_review.invalidate();
+            let _=self.csv_review.poll();
+            return;
+        }
         if open && browse {
-            let dir=PathBuf::from(self.import_path.trim()).parent().filter(|p|p.is_absolute()&&p.is_dir()).map(|p|p.to_owned()).or_else(||{
-                let home=directories::BaseDirs::new()?.home_dir().to_owned();
-                let legacy=home.join(".ssh").join("quick-connect");
-                Some(if legacy.is_dir(){legacy}else{home})
-            });
+            let candidate=PathBuf::from(self.import_path.trim());
             let (tx,rx)=std::sync::mpsc::channel();
             match std::thread::Builder::new().name("homeops-csv-picker".into()).spawn(move||{
+                let dir=candidate.parent().filter(|p|p.is_absolute()&&p.is_dir()).map(|p|p.to_owned()).or_else(||{
+                    let home=directories::BaseDirs::new()?.home_dir().to_owned();
+                    let legacy=home.join(".ssh").join("quick-connect");
+                    Some(if legacy.is_dir(){legacy}else{home})
+                });
                 let mut dialog=rfd::FileDialog::new().set_title("Choose a device CSV").add_filter("CSV file",&["csv"]);
                 if let Some(dir)=dir {dialog=dialog.set_directory(dir);}
                 let _=tx.send(dialog.pick_file());
@@ -425,9 +470,13 @@ impl App {
         }
         if review {
             self.review=None;
-            let result=fs::File::open(self.import_path.trim()).map_err(|e|e.to_string())
-                .and_then(|f|book::bounded(f,1024*1024)).and_then(|bytes|book::parse_csv(&bytes));
-            match result { Ok(rows)=>{self.review=Some(rows);self.report(Ok("Review the CSV before adding devices.".into()));},Err(e)=>self.report(Err(e)) }
+            if let Err(e)=self.csv_review.start(&self.import_path){self.report(Err(e));}
+        }
+        if let Some(result)=self.csv_review.poll(){
+            match result { Ok(rows)=>{self.review=Some(rows);self.report(Ok("Review the SSH account and address before adding devices.".into()));},Err(e)=>self.report(Err(e)) }
+            ctx.request_repaint();
+        } else if self.csv_review.busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if apply && let Some(rows)=self.review.clone() {
             let mut b=self.book.clone();let before=b.devices.len();
@@ -575,6 +624,15 @@ impl eframe::App for App {
             });
         });
         egui::TopBottomPanel::bottom("status").show(ctx,|ui| {
+            if self.inventory_conflict {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(theme::roles(ctx).error,SaveError::Conflict.to_string());
+                    if ui.button("Reload saved inventory").clicked(){
+                        let result=self.reload_inventory(ctx);
+                        self.report(result);
+                    }
+                });
+            }
             if let Some(e)=&self.error{ui.colored_label(theme::roles(ctx).error,e);}
             else if self.status.is_empty(){ui.weak("Local inventory · No keys or passwords stored");}
             else {ui.label(&self.status);}
