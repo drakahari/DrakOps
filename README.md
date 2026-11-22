@@ -7,7 +7,7 @@ DrakOps keeps the computers you manage in one place and opens SSH connections to
 ## Downloads and walkthrough
 
 - [Windows x64: DrakOps 0.1.0-rc.2](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.2): unsigned portable ZIP, with Direct3D 12 and corrected theme restoration.
-- [Omarchy x86_64: DrakOps 0.1.0-rc.1](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.1). Other Linux distributions are not yet verified for this binary.
+- [Omarchy x86_64: DrakOps 0.1.0-rc.2 Linux Wayland update](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.2-linux.1): requires glibc 2.43 or newer. This archive was tested on Omarchy only.
 - [Watch the one-device walkthrough](https://github.com/drakahari/DrakOps/releases/download/v0.1.0-rc.1/DrakOps-0.1.0-rc.1-Walkthrough.mp4).
 - A packaged macOS download is pending. Source build notes are below.
 
