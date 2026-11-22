@@ -5,6 +5,64 @@ use std::{sync::{Arc,atomic::{AtomicUsize,Ordering}},time::Duration};
 
 const MAX_TABS: usize = 8;
 const COPIED_SECONDS: f64 = 2.;
+const TERMINAL_ROW_HEIGHT: f32 = 16.;
+const HISTORY_BAR: f32 = 16.;
+
+#[derive(Default)]
+struct ScrollGesture {
+    wheel_remainder: f32,
+    thumb_grab: Option<f32>,
+}
+impl ScrollGesture {
+    fn wheel(&mut self, point_delta: f32, offset: usize, limit: usize) -> usize {
+        let exact = self.wheel_remainder + point_delta / TERMINAL_ROW_HEIGHT;
+        let lines = exact.trunc() as isize;
+        let next = offset.saturating_add_signed(lines).min(limit);
+        self.wheel_remainder = if next == 0 && exact < 0. || next == limit && exact > 0. {
+            0.
+        } else {
+            exact.fract()
+        };
+        next
+    }
+}
+
+fn thumb_rect(track: egui::Rect, rows: u16, offset: usize, limit: usize) -> egui::Rect {
+    let rows = f32::from(rows);
+    let thumb = (track.height() * rows / (rows + limit as f32)).clamp(14_f32.min(track.height()),track.height());
+    let travel = track.height() - thumb;
+    let top = track.top() + if limit == 0 { 0. } else { travel * (limit - offset.min(limit)) as f32 / limit as f32 };
+    egui::Rect::from_min_size(egui::pos2(track.left(), top), egui::vec2(track.width(), thumb))
+}
+
+fn scroll_bar(ui: &mut egui::Ui, gutter: egui::Rect, tab_id: usize, rows: u16,
+              offset: usize, limit: usize, gesture: &mut ScrollGesture, enabled: bool) -> usize {
+    let track = gutter.shrink2(egui::vec2(3., 1.));
+    let thumb = thumb_rect(track, rows, offset, limit);
+    let response = ui.interact(gutter, ui.make_persistent_id(("terminal-scrollbar", tab_id)), egui::Sense::click_and_drag())
+        .on_hover_text("Drag to scroll this tab's terminal history");
+    response.widget_info(||egui::WidgetInfo::labeled(egui::WidgetType::Other,true,"Terminal history scrollbar"));
+    if response.drag_started() {
+        gesture.thumb_grab = ui.input(|i|i.pointer.press_origin()).map(|origin|
+            if thumb.expand2(egui::vec2(3.,0.)).contains(origin) {origin.y - thumb.top()} else {thumb.height()/2.});
+    }
+    let mut next = offset;
+    if enabled && let Some(pos)=response.interact_pointer_pos() {
+        let grab = if response.dragged() { gesture.thumb_grab.unwrap_or(thumb.height()/2.) }
+            else { thumb.height()/2. };
+        let travel=track.height()-thumb.height();
+        if travel > 0. && (response.dragged() || (response.clicked() && !thumb.contains(pos))) {
+            let progress=((pos.y-track.top()-grab)/travel).clamp(0.,1.);
+            next=((1.-progress)*limit as f32).round() as usize;
+        }
+    }
+    if response.drag_stopped() || !response.is_pointer_button_down_on() { gesture.thumb_grab=None; }
+    let colors=theme::roles(ui.ctx());
+    ui.painter().rect_filled(track,4.,colors.border);
+    ui.painter().rect_filled(thumb_rect(track,rows,next,limit),4.,
+        if response.dragged() || response.hovered() {colors.accent}else{colors.muted});
+    next
+}
 
 fn copied_badge(ui:&mut egui::Ui,deadline:Option<f64>){
     let now=ui.input(|i|i.time);
@@ -119,6 +177,7 @@ struct TerminalTab {
     demo: Option<vt100::Parser>,
     closing: bool,
     copied_until: Option<f64>,
+    scroll: ScrollGesture,
 }
 impl TerminalTab {
     fn active(&self)->bool {self.session.as_ref().is_some_and(|s|s.state().is_active())}
@@ -471,8 +530,12 @@ fn keyboard(ui: &mut egui::Ui, hit: &egui::Response, requested: bool, running: b
 
 impl App {
     pub(super) fn terminal_panel(&mut self, ctx: &egui::Context, _frame:&eframe::Frame) {
-        let auto_copy=self.book.copy_on_select;
-        let deck=&mut self.terminal;
+        self.terminal.panel(ctx,self.book.copy_on_select);
+    }
+}
+impl TerminalUi {
+    fn panel(&mut self, ctx:&egui::Context, auto_copy:bool) {
+        let deck=self;
         deck.poll();
         let selected_id=deck.tabs.get(deck.selected).map_or(0,|t|t.id);
         if let Some(until)=deck.deferred_copy.begin(ctx,selected_id)
@@ -546,10 +609,25 @@ impl App {
                 let focus=ui.make_persistent_id(("terminal-input-focus",tab_id));
                 let mut paste_click=false;
                 let mut copy_click=false;
+                let mut jump_live=false;
+                let mut page_direction=0_isize;
+                let (mut offset, limit)=t.session.as_mut().map(Session::scrollback).unwrap_or_default();
+                let alternate=t.session.as_ref().is_some_and(|s|s.screen().alternate_screen());
+                let page_rows=t.session.as_ref().map_or(1,|s|s.screen().size().0.saturating_sub(1).max(1)) as isize;
                 ui.horizontal_wrapped(|ui| {
                     ui.strong("SSH terminal");
                     ui.label(RichText::new(&t.target).monospace());
                     if let Some(s)=&t.session{ui.weak(s.state().label());}
+                    if t.session.is_some() {
+                        if ui.add_enabled(offset<limit && !alternate,egui::Button::new("Older").small())
+                            .on_hover_text("Scroll back one page locally").clicked(){page_direction=1;}
+                        if ui.add_enabled(offset>0 && !alternate,egui::Button::new("Newer").small())
+                            .on_hover_text("Scroll forward one page locally").clicked(){page_direction=-1;}
+                        jump_live=ui.add_enabled(offset>0 && !alternate,egui::Button::new("Jump to live").small())
+                            .on_hover_text(format!("Viewing history · {offset} lines back"))
+                            .on_disabled_hover_text(if alternate {"History paused in full-screen programs."} else {"Showing live terminal output."})
+                            .clicked();
+                    }
                     if t.demo.is_some(){ui.weak("Read-only sample. No SSH connection.");}
                     if t.session.as_ref().is_some_and(|s| matches!(s.state(),terminal::State::Running)) {
                         paste_click=ui.small_button("Paste").on_hover_text("Review one line locally before sending").clicked();
@@ -589,11 +667,21 @@ impl App {
                 if t.session.is_none() && t.demo.is_none() { return; }
                 let h=ui.available_height().max(28.);
                 let width=ui.available_width();
-                let dims=(h / 16.).floor().clamp(2., f32::from(terminal::MAX_ROWS)) as u16;
+                let inner_height=(h-12.).max(12.);
+                let dims=(inner_height / TERMINAL_ROW_HEIGHT).floor().clamp(2., f32::from(terminal::MAX_ROWS)) as u16;
+                // Resizing a finished vt100 screen truncates its bottom rows.
+                // Keep that screen intact and let egui scroll just its viewport.
+                let render_rows=t.session.as_ref().map_or(dims,|s|{
+                    if s.state().is_active() {dims} else {s.screen().size().0}
+                });
+                let overflow=f32::from(render_rows)*TERMINAL_ROW_HEIGHT>inner_height;
                 let cw=ui.fonts_mut(|f|f.glyph_width(&FontId::new(13.,FontFamily::Monospace),'M')).max(1.);
-                let cols=((width - 16.) / cw).floor().clamp(2., f32::from(terminal::MAX_COLS)) as u16;
+                // Keep terminal dimensions stable when the first line enters history or a pager opens.
+                let history_width=if t.session.is_some() { HISTORY_BAR } else { 0. };
+                let cols=((width - 16. - history_width) / cw).floor().clamp(2., f32::from(terminal::MAX_COLS)) as u16;
                 let rect=ui.available_rect_before_wrap();
-                let hit=ui.interact(rect,focus,egui::Sense::focusable_noninteractive());
+                let body=egui::Rect::from_min_max(rect.min,egui::pos2(rect.right()-history_width,rect.bottom()));
+                let hit=ui.interact(body,focus,egui::Sense::focusable_noninteractive());
                 hit.widget_info(||egui::WidgetInfo::labeled(egui::WidgetType::Other,true,"SSH terminal. Press F2 to enable typing."));
                 let focus_outline=hit.has_focus();
                 let running=deck.show && !switched && !close_tab && !deck.close_app && t.running();
@@ -616,16 +704,55 @@ impl App {
                     }
                 }
                 let blocked=paste_was_open || paste_click;
+                let allow_history=deck.show && !switched && !close_tab && !deck.close_app && !blocked && focused;
+                let frame_bounds=ui.clip_rect().intersect(rect);
+                let hover=ui.input(|i| (!i.pointer.primary_down()).then(|| i.pointer.hover_pos()).flatten());
+                let hovering=hover.is_some_and(|pos|frame_bounds.contains(pos) && ctx.layer_id_at(pos)==Some(ui.layer_id()));
+                let wheel=if allow_history && limit>0 && hovering {
+                    ui.input_mut(|i|{
+                        if offset==0 && overflow && i.smooth_scroll_delta.y<0. { 0. }
+                        else { std::mem::take(&mut i.smooth_scroll_delta.y) }
+                    })
+                }else{0.};
+                let original_offset=offset;
+                if jump_live {
+                    offset=0;
+                    t.scroll.wheel_remainder=0.;
+                } else if page_direction!=0 {
+                    offset=offset.saturating_add_signed(page_direction*page_rows).min(limit);
+                    t.scroll.wheel_remainder=0.;
+                } else if wheel != 0. {
+                    offset=t.scroll.wheel(wheel,offset,limit);
+                }
+                let mut bar_active=false;
+                if limit>0 {
+                    let gutter=egui::Rect::from_min_max(
+                        egui::pos2(body.right(),rect.top()+6.),
+                        egui::pos2(rect.right()-3.,rect.bottom()-6.));
+                    let after=scroll_bar(ui,gutter,tab_id,dims,offset,limit,&mut t.scroll,allow_history);
+                    bar_active=after!=offset || ui.input(|i|i.pointer.primary_down() &&
+                        i.pointer.press_origin().is_some_and(|pos|gutter.contains(pos)));
+                    offset=after;
+                } else {
+                    t.scroll=ScrollGesture::default();
+                }
+                let navigating=jump_live || page_direction!=0 || wheel!=0. || bar_active;
+                if offset!=original_offset || bar_active {
+                    if offset!=original_offset && let Some(s)=t.session.as_mut() {s.set_scrollback(offset);}
+                    deck.drag_start=None;
+                    deck.label_origin=false;
+                    ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().clear_selection();
+                }
                 // The background tab's close control is not an instruction to
                 // activate it or release the current session's keyboard capture.
                 let preserve_capture=background_close_pointer && deck.capture;
                 let routed=keyboard(ui,&hit,preserve_capture,running && !deck.copy_mode && !blocked,&mut deck.capture,app_cursor);
-                if routed.copy {deck.copy_mode=true;deck.capture=false;}
+                if routed.copy && !navigating {deck.copy_mode=true;deck.capture=false;}
                 let bytes=if let Some(bytes)=submitted {
                     // Leave terminal capture released. Even a held Enter or
                     // queued key from the editor cannot reach SSH after closing.
                     deck.capture=false;t.error.clear();bytes
-                } else if running && deck.capture && !deck.copy_mode && !blocked {
+                } else if running && deck.capture && !deck.copy_mode && !blocked && !navigating {
                     match routed.paste {
                         Some(Ok(bytes))=>{t.error.clear();bytes}
                         Some(Err(e))=>{t.error=e.into();Vec::new()}
@@ -637,12 +764,34 @@ impl App {
                     if s.state().is_active() && s.screen().size()!=(dims,cols) {
                         let _=s.resize(dims,cols);
                     }
-                    if !bytes.is_empty() && let Err(e)=s.send(&bytes){t.error=e;}
+                    if !bytes.is_empty() {
+                        match s.send(&bytes) {
+                            Ok(()) if offset>0=>{
+                                s.set_scrollback(0);
+                                offset=0;
+                                t.scroll.wheel_remainder=0.;
+                                deck.drag_start=None;
+                                deck.label_origin=false;
+                                ctx.plugin::<egui::text_selection::LabelSelectionState>().lock().clear_selection();
+                            }
+                            Ok(())=>(),
+                            Err(e)=>t.error=e,
+                        }
+                    }
                 }
                 let colors=theme::roles(ctx);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(body),|ui|{
                 egui::Frame::new().fill(colors.background).stroke(egui::Stroke::new(1.0_f32,if has_focus || focus_outline{colors.accent}else{colors.border})).inner_margin(5).show(ui,|ui| {
-                    ui.set_min_width((width-12.).max(25.));
-                    egui::ScrollArea::both().id_salt(("terminal-body",tab_id)).auto_shrink([false,false]).max_height((h-11.).max(12.)).show(ui,|ui| {
+                    ui.set_min_width((width-12.-history_width).max(25.));
+                    let mut viewport=egui::ScrollArea::new([true,deck.copy_mode || overflow])
+                        .id_salt(("terminal-body",tab_id,deck.copy_mode))
+                        .auto_shrink([false,false]).max_height(inner_height)
+                        .stick_to_bottom(overflow && !deck.copy_mode && offset==0);
+                    if overflow {
+                        if jump_live {viewport=viewport.vertical_scroll_offset(f32::from(render_rows)*TERMINAL_ROW_HEIGHT);}
+                        else if navigating && offset>0 {viewport=viewport.vertical_scroll_offset(0.);}
+                    }
+                    viewport.show(ui,|ui| {
                         if let Some(s)=&t.session{
                             if deck.copy_mode {
                                 use std::hash::{Hash,Hasher};
@@ -661,8 +810,8 @@ impl App {
                                     }
                                 });
                             }else{
-                                let bounds=ui.clip_rect().intersect(rect);
-                                let copy=copy_gesture(ui,bounds,auto_copy && !blocked && deck.show && !switched && !close_tab && !deck.close_app,&mut deck.drag_start);
+                                let bounds=ui.clip_rect().intersect(body);
+                                let copy=copy_gesture(ui,bounds,auto_copy && !blocked && !navigating && deck.show && !switched && !close_tab && !deck.close_app,&mut deck.drag_start);
                                 if ui.input(|i|i.pointer.primary_pressed()) {
                                     let pointer=ui.input(|i|i.pointer.interact_pos());
                                     deck.label_origin=pointer.is_some_and(|pos|bounds.contains(pos)
@@ -679,11 +828,12 @@ impl App {
                                 if (copy || selected) && !blocked && deck.show && !switched && !close_tab && !deck.close_app {
                                     deck.deferred_copy.arm_this_pass=true;
                                 }
-                                scoped_copy(ui,copy,|ui|render(ui,s.screen(),has_focus,16.));
+                                scoped_copy(ui,copy,|ui|render(ui,s.screen(),has_focus && offset==0,TERMINAL_ROW_HEIGHT));
                             }
                         }
                         if let Some(parser)=&t.demo{render(ui,parser.screen(),false,16.);}
                     });
+                });
                 });
             });
         if let Some(i)=close_requested {deck.close_tab(i);}
@@ -693,6 +843,105 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_accumulates_small_deltas_and_history_gestures_are_tab_local() {
+        let mut one=ScrollGesture::default();
+        let mut two=ScrollGesture::default();
+        assert_eq!(one.wheel(8.,0,50),0);
+        assert_eq!(two.wheel(8.,0,50),0);
+        assert_eq!(one.wheel(24.,0,50),2);
+        assert_eq!(two.wheel(8.,0,50),1);
+        assert_eq!(one.wheel(999.,49,50),50);
+        assert_eq!(one.wheel(-16.,50,50),49);
+        assert_eq!(one.wheel(-999.,49,50),0);
+    }
+
+    #[test]
+    fn scrollbar_drags_the_live_thumb_to_the_oldest_retained_row() {
+        let ctx=egui::Context::default();
+        let gutter=egui::Rect::from_min_size(egui::pos2(200.,30.),egui::vec2(16.,180.));
+        let track=gutter.shrink2(egui::vec2(3.,1.));
+        let grab=thumb_rect(track,20,0,500).center();
+        let top=egui::pos2(grab.x,gutter.top()+1.);
+        let mut gesture=ScrollGesture::default();
+        let mut offset=0;
+        let button=|pos,pressed|egui::Event::PointerButton{pos,button:egui::PointerButton::Primary,pressed,modifiers:egui::Modifiers::NONE};
+        let mut frame=|events|{
+            let _=ctx.run(egui::RawInput{events,..Default::default()},|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui|{
+                    offset=scroll_bar(ui,gutter,17,20,offset,500,&mut gesture,true);
+                });
+            });
+        };
+        frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(grab),button(grab,true)]);
+        frame(vec![egui::Event::PointerMoved(top)]);
+        frame(vec![button(top,false)]);
+        assert_eq!(offset,500);
+        assert!(gesture.thumb_grab.is_none());
+    }
+    #[test]
+    fn terminal_panel_scrolls_synthetic_output_without_routing_input_and_passes_pager_keys() {
+        let ctx=egui::Context::default();
+        let (session,io)=crate::terminal::tests::synthetic_io();
+        let mut deck=TerminalUi {
+            show:true,
+            tabs:vec![TerminalTab {id:23,session:Some(session),target:"fixture".into(),..Default::default()}],
+            ..Default::default()
+        };
+        fn frame(ctx:&egui::Context,deck:&mut TerminalUi,events:Vec<egui::Event>) {
+            let bounds=egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(800.,600.));
+            let _=ctx.run(egui::RawInput{screen_rect:Some(bounds),focused:true,events,..Default::default()},|ctx|deck.panel(ctx,false));
+        }
+        let output=(1..=90).map(|line|format!("line-{line:04}\r\n")).collect::<String>();
+        io.output.send(output.into_bytes()).unwrap();
+        frame(&ctx,&mut deck,vec![]);
+        let body=egui::pos2(350.,540.);
+        let pointer=|pressed|egui::Event::PointerButton{pos:body,button:egui::PointerButton::Primary,pressed,modifiers:Modifiers::NONE};
+        frame(&ctx,&mut deck,vec![egui::Event::PointerMoved(body),pointer(true)]);
+        frame(&ctx,&mut deck,vec![pointer(false)]);
+        assert!(deck.capture);
+        let wheel=egui::Event::MouseWheel{unit:egui::MouseWheelUnit::Point,delta:egui::vec2(0.,960.),modifiers:Modifiers::NONE};
+        frame(&ctx,&mut deck,vec![wheel,egui::Event::Text("must not go through".into())]);
+        assert!(deck.tabs[0].session.as_ref().unwrap().screen().scrollback()>0);
+        assert!(io.input.try_recv().is_err());
+
+        io.output.send(b"\x1b[?1049lpause\x1b[?1049hfull-screen pager".to_vec()).unwrap();
+        let page_up=egui::Event::Key{key:Key::PageUp,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::NONE};
+        frame(&ctx,&mut deck,vec![page_up]);
+        let screen=deck.tabs[0].session.as_ref().unwrap().screen();
+        assert!(screen.alternate_screen() && screen.contents().contains("full-screen pager"));
+        assert_eq!(screen.scrollback(),0);
+        assert_eq!(io.input.try_recv().unwrap(),b"\x1b[5~");
+    }
+
+    #[test]
+    fn shrinking_an_exited_terminal_keeps_and_displays_its_last_row() {
+        let ctx=egui::Context::default();
+        let (mut session,io)=crate::terminal::tests::synthetic_io();
+        session.resize(20,80).unwrap();
+        let mut deck=TerminalUi {
+            show:true,
+            tabs:vec![TerminalTab {id:24,session:Some(session),target:"fixture".into(),..Default::default()}],
+            ..Default::default()
+        };
+        io.output.send(b"\x1b[20;1Hbottom marker".to_vec()).unwrap();
+        io.finish();
+        let raw=||egui::RawInput {
+            screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(640.,300.))),
+            focused:true,..Default::default()
+        };
+        let _=ctx.run(raw(),|ctx|deck.panel(ctx,false));
+        let output=ctx.run(raw(),|ctx|deck.panel(ctx,false));
+        assert_eq!(deck.tabs[0].session.as_ref().unwrap().screen().size().0,20);
+        let visible=output.shapes.iter().any(|clipped|{
+            matches!(&clipped.shape,egui::Shape::Text(text) if text.galley.text().contains("bottom marker") &&
+                clipped.clip_rect.intersects(egui::Rect::from_min_size(text.pos,text.galley.size())))
+        });
+        assert!(visible,"last row should be visible without truncating the finished screen buffer");
+    }
+
     use egui::Modifiers;
     #[test]
     fn terminal_text_does_not_execute_clipboard_or_rewrite_controls() {
@@ -705,6 +954,8 @@ mod tests {
         assert_eq!(input(&key(Key::C,Modifiers::CTRL),false),Some(vec![3]));
         assert_eq!(input(&key(Key::ArrowUp,Modifiers::NONE),true),Some(b"\x1bOA".to_vec()));
         assert_eq!(input(&key(Key::Enter,Modifiers::NONE),false),Some(vec![13]));
+        assert_eq!(input(&key(Key::PageUp,Modifiers::NONE),true),Some(b"\x1b[5~".to_vec()));
+        assert_eq!(input(&key(Key::PageDown,Modifiers::NONE),true),Some(b"\x1b[6~".to_vec()));
     }
     #[test]
     fn gui_body_click_or_explicit_f2_arms_keyboard_and_outside_stops_capture() {

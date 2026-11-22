@@ -11,7 +11,18 @@ use std::{
 
 pub const MAX_ROWS: u16 = 64;
 pub const MAX_COLS: u16 = 200;
-pub const SCROLLBACK: usize = 200;
+pub const SCROLLBACK: usize = 3_000;
+/// vt100 clamps in constant time and keeps a nonzero viewport anchored when
+/// primary-screen lines append, until its oldest retained row is evicted.
+pub(crate) fn available_scrollback(screen: &mut vt100::Screen) -> usize {
+    if screen.alternate_screen() { return 0; }
+    let offset = screen.scrollback();
+    screen.set_scrollback(SCROLLBACK);
+    let available = screen.scrollback();
+    screen.set_scrollback(offset);
+    available
+}
+
 pub const MAX_INPUT: usize = 4096;
 const FRAME: usize = 4096;
 const QUEUE: usize = 32;
@@ -106,7 +117,13 @@ impl Session {
     }
     pub fn state(&self) -> &State { &self.state }
     pub fn screen(&self) -> &vt100::Screen { self.parser.screen() }
-    pub fn set_scrollback(&mut self, rows: usize) { self.parser.screen_mut().set_scrollback(rows.min(SCROLLBACK)); }
+    pub fn scrollback(&mut self) -> (usize, usize) {
+        let screen = self.parser.screen_mut();
+        (screen.scrollback(), available_scrollback(screen))
+    }
+    pub fn set_scrollback(&mut self, rows: usize) {
+        self.parser.screen_mut().set_scrollback(rows.min(SCROLLBACK));
+    }
 
     /// Queue only intentional user input. Never send a parser response.
     pub fn send(&self, bytes: &[u8]) -> Result<(), String> {
@@ -271,6 +288,68 @@ fn ssh_arguments(args: &[String]) -> Result<Vec<String>, String> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn retained_primary_rows_anchor_when_output_arrives_and_pager_stays_separate() {
+        let mut parser=vt100::Parser::new(5,32,SCROLLBACK);
+        for line in 1..=80 {parser.process(format!("line-{line:04}\r\n").as_bytes());}
+        assert_eq!(available_scrollback(parser.screen_mut()),76);
+        assert_eq!(parser.screen().scrollback(),0);
+        parser.screen_mut().set_scrollback(25);
+        let anchored=parser.screen().contents();
+        parser.process(b"another line\r\n");
+        assert_eq!(parser.screen().contents(),anchored);
+        assert_eq!(available_scrollback(parser.screen_mut()),77);
+        assert_eq!(parser.screen().scrollback(),26);
+        parser.process(b"\x1b[?1049hpager sample");
+        assert!(parser.screen().alternate_screen());
+        assert_eq!(available_scrollback(parser.screen_mut()),0);
+        assert!(parser.screen().contents().contains("pager sample"));
+        parser.process(b"\x1b[?1049l");
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(parser.screen().scrollback(),0);
+        assert_eq!(available_scrollback(parser.screen_mut()),77);
+        assert!(parser.screen().contents().contains("another line"));
+    }
+
+    #[test]
+    fn history_caps_and_oldest_view_clamps_as_rows_are_evicted() {
+        let mut parser=vt100::Parser::new(4,32,SCROLLBACK);
+        for line in 0..(SCROLLBACK+15) {
+            parser.process(format!("row-{line:04}\r\n").as_bytes());
+        }
+        assert_eq!(available_scrollback(parser.screen_mut()),SCROLLBACK);
+        parser.screen_mut().set_scrollback(SCROLLBACK+1);
+        let before=parser.screen().contents();
+        parser.process(b"new output\r\n");
+        assert_eq!(parser.screen().scrollback(),SCROLLBACK);
+        assert_ne!(parser.screen().contents(),before);
+        parser.screen_mut().set_scrollback(0);
+        assert!(parser.screen().contents().contains("new output"));
+    }
+
+    pub(crate) struct SyntheticIo {
+        pub(crate) output: SyncSender<Vec<u8>>,
+        pub(crate) input: Receiver<Vec<u8>>,
+        events: mpsc::Sender<WorkerEvent>,
+    }
+    impl SyntheticIo {
+        pub(crate) fn finish(&self) { self.events.send(WorkerEvent::Done(State::Exited(0))).unwrap(); }
+    }
+
+    /// No executable, socket, network target or credentials; use only for UI-path tests.
+    pub(crate) fn synthetic_io() -> (Session, SyntheticIo) {
+        let (in_tx,input)=mpsc::sync_channel(QUEUE);
+        let (output,out_rx)=mpsc::sync_channel(QUEUE);
+        let (event_tx,events)=mpsc::channel();
+        let session=Session {
+            parser:vt100::Parser::new(24,80,SCROLLBACK), state:State::Running,
+            cancel:Arc::new(AtomicBool::new(false)), size:Arc::new(AtomicU32::new(pack(24,80))),
+            input:Some(in_tx), output:Some(out_rx), events,
+        };
+        (session,SyntheticIo {output,input,events:event_tx})
+    }
+
     use std::time::Instant;
 
     fn strings(args: &[&str]) -> Vec<String> { args.iter().map(|s| (*s).into()).collect() }
