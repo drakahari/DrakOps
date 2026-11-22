@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, io::{Read, Write}, net::IpAddr, path::Path};
+use std::{collections::HashSet, fs, io::{Read, Write}, net::IpAddr, path::Path};
 use tempfile::NamedTempFile;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +121,8 @@ impl Default for Book {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Revision(Option<Vec<u8>>);
 
+pub(crate) const MAX_DEVICES: usize = 5000;
+
 #[derive(Debug)]
 pub enum SaveError {
     Busy,
@@ -165,10 +167,11 @@ impl Book {
         let Some(bytes) = &revision.0 else { return Ok((Self::default(), revision)); };
         let b: Self = serde_json::from_slice(bytes).map_err(err)?;
         if b.version != 1 { return Err("This inventory was written by a different version of DrakOps.".into()); }
-        if b.devices.len() > 5000 { return Err("Inventory exceeds the device limit.".into()); }
-        for (i,d) in b.devices.iter().enumerate() {
+        if b.devices.len() > MAX_DEVICES { return Err("Inventory exceeds the device limit.".into()); }
+        let mut aliases=HashSet::with_capacity(b.devices.len());
+        for d in &b.devices {
             d.validate()?;
-            if b.devices[..i].iter().any(|x| x.alias.eq_ignore_ascii_case(&d.alias)) {
+            if !aliases.insert(d.alias.to_ascii_lowercase()) {
                 return Err("Duplicate alias in the inventory.".into());
             }
         }
@@ -180,7 +183,7 @@ impl Book {
         let storage = |e: std::io::Error| SaveError::Storage(err(e));
         let dir = path.parent().ok_or_else(|| SaveError::Storage("Inventory directory is missing.".into()))?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| SaveError::Storage(err(e)))?;
-        if bytes.len() > 8 * 1024 * 1024 || self.devices.len() > 5000 {
+        if bytes.len() > 8 * 1024 * 1024 || self.devices.len() > MAX_DEVICES {
             return Err(SaveError::Storage("Inventory exceeds the size limit.".into()));
         }
         fs::create_dir_all(dir).map_err(storage)?;
@@ -220,14 +223,15 @@ pub fn parse_csv(bytes: &[u8]) -> Result<Vec<Device>, String> {
         return Err("Expected this hosts.csv header: alias,hostname,user,port".into());
     }
     let mut rows: Vec<Device> = Vec::new();
+    let mut aliases=HashSet::new();
     for (i, rec) in r.records().enumerate() {
-        if i >= 5000 { return Err("CSV exceeds the 5000-device review limit.".into()); }
+        if i >= MAX_DEVICES { return Err("CSV exceeds the 5000-device review limit.".into()); }
         let rec = rec.map_err(err)?;
         let d = Device { alias: rec[0].into(), host: rec[1].into(), user: rec[2].into(),
             port: rec[3].parse().map_err(|_| format!("Record {}: invalid port.",i+1))?,
             ..Device::default() };
         d.validate().map_err(|e| format!("Record {}: {e}",i+1))?;
-        if rows.iter().any(|x| x.alias.eq_ignore_ascii_case(&d.alias)) {
+        if !aliases.insert(d.alias.to_ascii_lowercase()) {
             return Err(format!("Duplicate alias in CSV: {}", d.alias));
         }
         rows.push(d);

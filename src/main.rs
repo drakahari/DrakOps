@@ -12,7 +12,7 @@ mod external_terminal;
 mod ssh_setup;
 use book::{Book, Device, DeviceKind, Revision, Route, SaveError};
 use eframe::egui::{self, ComboBox, RichText, ScrollArea, TextEdit};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::{BTreeMap, HashSet}, path::PathBuf};
 
 const TITLE: &str = "DrakOps | Home SysOps";
 const SUBTITLE: &str = "Home SysOps";
@@ -434,13 +434,19 @@ impl App {
             }
             else if self.csv_review.busy(){ui.weak("The previous CSV read is still finishing.");}
             if let Some(rows)=&self.review {
-                let duplicate=|row:&Device| self.book.devices.iter().any(|d|d.alias.eq_ignore_ascii_case(&row.alias));
+                let saved:HashSet<_>=self.book.devices.iter().map(|d|d.alias.to_ascii_lowercase()).collect();
+                let duplicate=|row:&Device|saved.contains(&row.alias.to_ascii_lowercase());
                 let additions=rows.iter().filter(|r|!duplicate(r)).count();
                 ui.label(format!("{additions} new · {} existing skipped",rows.len()-additions));
-                ScrollArea::vertical().max_height(190.).show(ui,|ui|for row in rows {
-                    ui.label(format!("{} · {}{}",row.alias,endpoint(row,Route::Saved),if duplicate(row) {" (already exists)"}else{""}));
+                ScrollArea::vertical().max_height(190.).show_rows(ui,ui.text_style_height(&egui::TextStyle::Body),rows.len(),|ui,range|{
+                    for row in &rows[range] {
+                        let label=format!("{} · {}{}",row.alias,endpoint(row,Route::Saved),if duplicate(row) {" (already exists)"}else{""});
+                        ui.add(egui::Label::new(&label).truncate()).on_hover_text(label);
+                    }
                 });
-                apply=ui.add_enabled(additions>0,egui::Button::new("Add new devices")).clicked();
+                let fits=self.book.devices.len()+additions<=book::MAX_DEVICES;
+                if !fits {ui.weak("This import would exceed the inventory's device limit. Review a smaller CSV.");}
+                apply=ui.add_enabled(additions>0 && fits,egui::Button::new("Add new devices")).clicked();
             }
             if let Some(e)=&self.error {ui.colored_label(theme::roles(ctx).error,e);}
         });
@@ -480,7 +486,8 @@ impl App {
         }
         if apply && let Some(rows)=self.review.clone() {
             let mut b=self.book.clone();let before=b.devices.len();
-            for row in rows { if !b.devices.iter().any(|d|d.alias.eq_ignore_ascii_case(&row.alias)) {b.devices.push(row);} }
+            let mut aliases:HashSet<_>=b.devices.iter().map(|d|d.alias.to_ascii_lowercase()).collect();
+            b.devices.extend(rows.into_iter().filter(|row|aliases.insert(row.alias.to_ascii_lowercase())));
             let added=b.devices.len()-before;
             let r=self.replace(b);if r.is_ok(){self.show_import=false;self.review=None;if self.selected.is_none(){self.selected=self.book.devices.first().map(|d|d.alias.clone());}}
             self.report(r.map(|_|format!("{added} devices added.")));
