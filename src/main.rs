@@ -594,6 +594,33 @@ impl eframe::App for App {
         self.terminal.finish_frame(ctx);
     }
 }
+#[cfg(windows)]
+fn windows_graphics(options:&mut eframe::NativeOptions,software_only:bool,diagnostics:bool) {
+    use eframe::{egui_wgpu::WgpuSetupCreateNew,wgpu};
+    let mut setup=WgpuSetupCreateNew::default();
+    setup.instance_descriptor.backends=wgpu::Backends::DX12;
+    setup.instance_descriptor.backend_options.dx12.shader_compiler=wgpu::Dx12Compiler::Fxc;
+    setup.native_adapter_selector=Some(std::sync::Arc::new(move |adapters,surface|{
+        let usable=|a:&&wgpu::Adapter|surface.is_none_or(|s|a.is_surface_supported(s));
+        let software=|a:&&wgpu::Adapter|a.get_info().device_type==wgpu::DeviceType::Cpu;
+        let mut compatible=adapters.iter().filter(usable);
+        let selected=if software_only {compatible.find(software)} else {
+            compatible.clone().find(|a|!software(a)).or_else(||compatible.find(software))
+        };
+        if let Some(adapter)=selected {
+            if diagnostics {
+                let info=adapter.get_info();
+                eprintln!("DrakOps graphics: {:?} / {:?} / {}",info.backend,info.device_type,info.name);
+            }
+            return Ok(adapter.clone());
+        }
+        Err(if software_only {"Windows did not provide a usable Direct3D 12 software adapter."}
+            else {"Windows did not provide a usable Direct3D 12 graphics or software adapter."}.into())
+    }));
+    options.renderer=eframe::Renderer::Wgpu;
+    options.wgpu_options.wgpu_setup=setup.into();
+}
+
 fn main()->eframe::Result {
     let demo=std::env::args().any(|arg|arg=="--demo");
     let demo_terminal=demo && std::env::args().any(|arg|arg=="--demo-terminal");
@@ -602,6 +629,14 @@ fn main()->eframe::Result {
         viewport=viewport.with_icon(icon);
     }
     let options=eframe::NativeOptions{viewport,..Default::default()};
+    #[cfg(windows)]
+    let options={
+        let mut options=options;
+        let software_only=std::env::args().any(|a|a=="--software-renderer");
+        let diagnostics=software_only || std::env::args().any(|a|a=="--graphics-diagnostics");
+        windows_graphics(&mut options,software_only,diagnostics);
+        options
+    };
     eframe::run_native(TITLE,options,Box::new(move |cc|{let mut app=App::new(cc,demo); if demo_terminal {let device=app.book.devices[0].clone();app.terminal.start(&device,Route::Saved,true);} Ok(Box::new(app))}))
 }
 #[cfg(test)]

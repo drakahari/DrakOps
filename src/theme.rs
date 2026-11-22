@@ -252,7 +252,11 @@ pub fn connect_split(ui:&mut egui::Ui)->(egui::Response,egui::Response) {
 pub fn apply(ctx: &egui::Context, id: &str) {
     let t=find(id);
     let r=t.roles;
-    ctx.set_visuals(themed_visuals(t));
+    let visuals = themed_visuals(t);
+    let mode = if visuals.dark_mode { egui::Theme::Dark } else { egui::Theme::Light };
+    // The saved palette owns appearance; the first native frame may introduce a different OS theme.
+    ctx.set_theme(mode);
+    ctx.set_visuals_of(mode, visuals);
     ctx.data_mut(|d| d.insert_temp(egui::Id::new("native-theme-roles"), r));
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -370,5 +374,30 @@ mod button_tests {
                 assert!(!disabled.enabled());
             });
         });
+    }
+}
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn application_palette_wins_over_first_native_system_theme() {
+        for (id, app_mode, system_mode) in [
+            ("dlms-ethereal", egui::Theme::Dark, egui::Theme::Light),
+            ("omarchy-ethereal", egui::Theme::Dark, egui::Theme::Light),
+            ("dlms-light", egui::Theme::Light, egui::Theme::Dark),
+        ] {
+            let ctx = egui::Context::default();
+            let t = find(id);
+            assert_eq!(t.id, id);
+            apply(&ctx, id);
+            for system_theme in [Some(system_mode), None, Some(system_mode)] {
+                let _ = ctx.run(egui::RawInput { system_theme, ..Default::default() }, |ctx| {
+                    assert_eq!(ctx.theme(), app_mode);
+                    assert_eq!(ctx.style().visuals.panel_fill, t.roles.background);
+                    assert_eq!(ctx.style().visuals.window_fill, t.roles.panel);
+                });
+            }
+        }
     }
 }

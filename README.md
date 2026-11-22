@@ -1,12 +1,13 @@
 # DrakOps
 
-**Home SysOps** · 0.1.0-rc.1 prerelease
+**Home SysOps** · prerelease
 
 DrakOps keeps the computers you manage in one place and opens SSH connections to them. Your device list stays on this computer. This is a prerelease. In the app, choose **Settings → About** to see the version.
 
 ## Downloads and walkthrough
 
-- [DrakOps 0.1.0-rc.1 release](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.1): Windows x64 and Linux x86_64 tested on Omarchy. Other Linux distributions are not yet verified for this binary.
+- [Windows x64: DrakOps 0.1.0-rc.2](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.2): unsigned portable ZIP, with Direct3D 12 and corrected theme restoration.
+- [Omarchy x86_64: DrakOps 0.1.0-rc.1](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.1). Other Linux distributions are not yet verified for this binary.
 - [Watch the one-device walkthrough](https://github.com/drakahari/DrakOps/releases/download/v0.1.0-rc.1/DrakOps-0.1.0-rc.1-Walkthrough.mp4).
 - A packaged macOS download is pending. Source build notes are below.
 

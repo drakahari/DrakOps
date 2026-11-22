@@ -1,11 +1,10 @@
 [package]
 name = "homeops"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 edition = "2024"
 publish = false
 
 [dependencies]
-eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 directories = "6"
@@ -20,6 +19,13 @@ vt100 = "=0.16.2"
 rfd = "=0.15.4"
 egui-winit = { version = "=0.33.3", default-features = false }
 raw-window-handle = "=0.6.2"
+
+[target.'cfg(not(windows))'.dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu"] }
+wgpu = { version = "=27.0.1", default-features = false, features = ["dx12"] }
 
 [patch.crates-io]
 portable-pty = { path = "vendor/portable-pty" }
