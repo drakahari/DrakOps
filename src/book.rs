@@ -140,8 +140,34 @@ impl std::fmt::Display for SaveError {
     }
 }
 
+fn nonblocking_option(options: &mut fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
+}
+
+fn require_regular(metadata: fs::Metadata) -> std::io::Result<()> {
+    if metadata.is_file() { Ok(()) }
+    else { Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,"Choose a regular file.")) }
+}
+
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<fs::File> {
+    require_regular(fs::metadata(path)?)?;
+    let mut options=fs::OpenOptions::new();
+    options.read(true);
+    // Reject a file that became a pipe before open without letting the open wait.
+    nonblocking_option(&mut options);
+    let file=options.open(path)?;
+    require_regular(file.metadata()?)?;
+    Ok(file)
+}
+
 fn inventory_bytes(path: &Path) -> Result<Revision, String> {
-    match fs::File::open(path) {
+    match open_regular(path) {
         Ok(file) => bounded(file, 8 * 1024 * 1024).map(|bytes| Revision(Some(bytes))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Revision(None)),
         Err(e) => Err(err(e)),
@@ -189,8 +215,16 @@ impl Book {
         fs::create_dir_all(dir).map_err(storage)?;
         // Keep the sidecar on disk for the lifetime of the inventory; never unlink it at unlock.
         let lock_path = path.with_extension("lock");
-        let lock = fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
-            .open(lock_path).map_err(storage)?;
+        match fs::metadata(&lock_path) {
+            Ok(metadata) => require_regular(metadata).map_err(storage)?,
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(storage(e)),
+        }
+        let mut options=fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        nonblocking_option(&mut options);
+        let lock=options.open(lock_path).map_err(storage)?;
+        require_regular(lock.metadata().map_err(storage)?).map_err(storage)?;
         match lock.try_lock() {
             Ok(()) => (),
             Err(fs::TryLockError::WouldBlock) => return Err(SaveError::Busy),
@@ -300,6 +334,19 @@ mod tests {
         assert!(matches!(loser.2, Err(SaveError::Busy | SaveError::Conflict)));
         assert!(matches!(loser.0.save(&p,&loser.1), Err(SaveError::Conflict)));
         assert_eq!(Book::read(&p).unwrap().0.theme,winner.0.theme);
+    }
+
+    #[test] fn held_sidecar_lock_is_a_nonblocking_retry() {
+        let dir=tempfile::tempdir().unwrap();
+        let path=dir.path().join("book.json");
+        let (book,revision)=Book::read(&path).unwrap();
+        let held=fs::OpenOptions::new().read(true).write(true).create_new(true)
+            .open(path.with_extension("lock")).unwrap();
+        held.try_lock().unwrap();
+        assert!(matches!(book.save(&path,&revision),Err(SaveError::Busy)));
+        assert!(!path.exists());
+        drop(held);
+        book.save(&path,&revision).unwrap();
     }
 
     #[test] fn external_change_is_never_overwritten_and_reload_can_save() {

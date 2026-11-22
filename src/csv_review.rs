@@ -1,6 +1,5 @@
 use crate::book::{self, Device};
 use std::{
-    fs::{self, OpenOptions},
     path::Path,
     sync::mpsc::{self, Receiver, TryRecvError},
 };
@@ -20,24 +19,8 @@ struct Job {
 }
 
 fn read_csv(path: &Path) -> ReviewResult {
-    let not_file = || "Choose a regular CSV file.".to_owned();
-    if !fs::metadata(path).map_err(|e| e.to_string())?.is_file() {
-        return Err(not_file());
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // If the node changes between the initial metadata check and open,
-        // a pipe must not block opening the actual handle.
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = options.open(path).map_err(|e| e.to_string())?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err(not_file());
-    }
-    let bytes = book::bounded(file, 1024 * 1024)?;
+    let file=book::open_regular(path).map_err(|e|e.to_string())?;
+    let bytes=book::bounded(file,1024*1024)?;
     book::parse_csv(&bytes)
 }
 
@@ -85,6 +68,7 @@ impl CsvReview {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn regular_csv_files_are_bounded_and_validate_the_account() {
@@ -106,7 +90,8 @@ mod tests {
         let fifo = dir.path().join("not-a-csv");
         let c_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
-        assert_eq!(read_csv(&fifo).unwrap_err(), "Choose a regular CSV file.");
+        assert_eq!(read_csv(&fifo).unwrap_err(),"Choose a regular file.");
+        assert_eq!(book::open_regular(&fifo).unwrap_err().kind(),std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
