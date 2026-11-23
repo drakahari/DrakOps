@@ -11,6 +11,8 @@ mod terminal_find;
 mod terminal_ui;
 mod external_terminal;
 mod ssh_setup;
+#[cfg(any(windows,test))]
+mod ssh_enroll;
 use book::{Book, Device, DeviceKind, Revision, Route, SaveError};
 use eframe::egui::{self, ComboBox, RichText, ScrollArea, TextEdit};
 use std::{collections::{BTreeMap, HashSet}, path::PathBuf};
@@ -267,7 +269,7 @@ impl App {
                         } else {
                             (theme::primary_button(ui,if self.path.is_some() {"Connect"} else {"Preview terminal"},!self.locked,egui::vec2(110.,33.)),None)
                         };
-                        if connect.on_hover_text("Embedded SSH uses an already verified OpenSSH host. For a new host use external SSH or copy the command.").clicked() {
+                        if connect.on_hover_text("Use an already verified SSH host. First connection or changed identity? See Verify this server.").clicked() {
                             self.terminal.start(&d,route,self.path.is_none());
                         }
                         if let Some(options)=options{
@@ -297,6 +299,14 @@ impl App {
                             self.report(Ok("Connection details copied.".into()));
                         }
                     });
+                    if self.path.is_some(){
+                        ui.collapsing("Verify this server", |ui| {
+                            ssh_setup::verification_guidance(ui);
+                            if ui.button("Open in external terminal").clicked(){
+                                self.report(external_terminal::open(&d,route).map(|_|"External terminal launch requested. Verify the server identity there.".into()));
+                            }
+                        });
+                    }
                 }
             });
         });
@@ -646,7 +656,9 @@ impl eframe::App for App {
             else {ui.label(&self.status);}
             if self.last_removed.is_some() && ui.button("Undo last device removal").clicked(){self.undo_remove();}
         });
-        self.terminal_panel(ctx,_frame); self.sidebar(ctx);self.details(ctx); if let Some(setup)=self.setup.take(){self.setup=setup.show(ctx,&mut self.key_install_attempts);}self.edit_window(ctx);self.import_window(ctx);self.discovery_window(ctx);self.lan_window(ctx);self.remove_dialog(ctx);
+        self.terminal_panel(ctx,_frame); self.sidebar(ctx);self.details(ctx); if let Some(setup)=self.setup.take(){
+            self.setup=setup.show(ctx,&mut self.key_install_attempts,&mut self.terminal,self.path.is_some() && !self.locked);
+        }self.edit_window(ctx);self.import_window(ctx);self.discovery_window(ctx);self.lan_window(ctx);self.remove_dialog(ctx);
         if self.show_about {
             let mut open=self.show_about;
             egui::Window::new("About DrakOps").open(&mut open).resizable(false).collapsible(false)

@@ -50,6 +50,7 @@ pub fn system_ssh() -> Result<PathBuf,String> {
     Err("System OpenSSH was not found. Use an ordinary terminal instead.".into())
 }
 
+#[cfg(not(target_os="windows"))]
 pub(super) fn system_copy_id()->Option<&'static str>{
     ["/usr/bin/ssh-copy-id","/bin/ssh-copy-id"].into_iter().find(|p|cfg!(unix) && std::path::Path::new(p).is_file())
 }
@@ -76,7 +77,14 @@ fn public_install_wrapper(tool:&str,args:&[String],expires:u64)->String{
     format!("#!/bin/sh\nPATH=/usr/bin:/bin; export PATH\numask 077\ndir=${{0%/*}}\n        mkdir -- \"$dir/claimed\" || exit 1\n        cleanup() {{ rm -f -- \"$dir/selected.pub\" \"$0\"; rmdir -- \"$dir/claimed\" \"$dir\" 2>/dev/null || :; }}\n        trap cleanup 0\ntrap 'exit 130' INT\ntrap 'exit 143' TERM\ntrap 'exit 129' HUP\n        now=$(date +%s) || exit 1\n        if [ \"$now\" -gt {expires} ]; then printf '%s\\n' 'Setup request expired. No key was installed.'; exit 1; fi\n        {invoke}\n")
 }
 
-pub(super) fn open_public_install(device:Device,route:Route,line:String)->Result<LaunchWatch,String>{
+pub(super) fn guided_install_available()->bool{
+    #[cfg(target_os="windows")]
+    { system_ssh().is_ok_and(|ssh|ssh.with_file_name("ssh-keygen.exe").is_file()) && windows_powershell().is_ok() }
+    #[cfg(not(target_os="windows"))]
+    { system_copy_id().is_some() }
+}
+
+pub(super) fn open_public_install(device:Device,route:Route,line:String,_source:&std::path::Path,_fingerprint:&str)->Result<LaunchWatch,String>{
     #[cfg(unix)]
     {
         let tool=system_copy_id().ok_or("System ssh-copy-id is not available. Use the manual steps.")?;
@@ -86,7 +94,36 @@ pub(super) fn open_public_install(device:Device,route:Route,line:String)->Result
         }).map_err(|_|"Could not start the installer handoff.")?;
         Ok(rx)
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os="windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let ssh=system_ssh()?;
+        let ps=windows_powershell()?;
+        let install=crate::ssh_enroll::enroll_args(&device,route,&line)?;
+        // Only OpenSSH loads the private identity. DrakOps checks its path
+        // and supplies its already-reviewed public fingerprint for proof.
+        let identity=_source.with_extension("");
+        let path=identity.to_str().ok_or("Unsupported key path. Use the manual steps.")?;
+        let path=path.strip_prefix(r"\\?\").unwrap_or(path);
+        if !matches!(std::path::Path::new(path).components().next(),Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(),std::path::Prefix::Disk(_))) || path.contains('%')
+            || !std::fs::symlink_metadata(&identity).is_ok_and(|m|m.is_file() && !m.file_type().is_symlink()){
+            return Err("A matching private-key file wasn't found next to this .pub file on a local drive. Choose another .pub file or use the manual steps.".into());
+        }
+        let test=crate::ssh_enroll::login_args(&device,route,path)?;
+        let keygen=ssh.with_file_name("ssh-keygen.exe");
+        if !keygen.is_file(){return Err("System ssh-keygen is unavailable. Use manual setup.".into());}
+        let verify_local=["-y".into(),"-f".into(),path.to_owned()];
+        let script=crate::ssh_enroll::powershell_script(
+            ssh.to_str().ok_or("Invalid OpenSSH path.")?,keygen.to_str().ok_or("Invalid ssh-keygen path.")?,
+            &verify_local,&line,&install,&test,_fingerprint);
+        let encoded=crate::ssh_enroll::encoded_powershell(&script);
+        if encoded.len()>28_000{return Err("This key or path is too long for the setup terminal. Use the manual steps.".into());}
+        let mut cmd=Command::new(ps);
+        cmd.creation_flags(0x10).args(["-NoLogo","-NoProfile","-NoExit","-EncodedCommand"]).arg(encoded);
+        launch(cmd)
+    }
+    #[cfg(not(any(unix,target_os="windows")))]
     {
         let _=(device,route,line);
         Err("Use the manual public-key steps on this computer.".into())
@@ -224,6 +261,14 @@ fn spawn(args: &[String], installer: Option<&str>) -> Result<LaunchWatch,String>
     let watching=launch(cmd)?;
     let _=dir.keep();
     Ok(watching)
+}
+
+#[cfg(target_os="windows")]
+fn windows_powershell()->Result<PathBuf,String>{
+    let root=std::env::var_os("SystemRoot").map(PathBuf::from).filter(|p|p.is_absolute())
+        .ok_or("Could not locate Windows system programs.")?;
+    let ps=root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+    if ps.is_file(){Ok(ps)}else{Err("Windows PowerShell was not found. Use the manual steps.".into())}
 }
 
 #[cfg(target_os="windows")]

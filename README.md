@@ -6,10 +6,10 @@ DrakOps keeps the computers you manage in one place and opens SSH connections to
 
 ## Downloads and walkthrough
 
-- [Windows x64: DrakOps 0.1.0 RC4](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.4): unsigned portable ZIP with Direct3D 12.
-- [Linux x86_64: DrakOps 0.1.0 RC4](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.4): shared archive, requires glibc 2.39 or newer and OpenGL.
+- [Windows x64: DrakOps 0.1.0 RC5](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.5): unsigned portable ZIP with Direct3D 12.
+- [Linux x86_64: DrakOps 0.1.0 RC5](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.5): shared archive, requires glibc 2.39 or newer and OpenGL.
 - [Watch the one-device walkthrough on YouTube](https://youtu.be/O0VCrI6YF0Q) · [Download MP4](https://github.com/drakahari/DrakOps/releases/download/v0.1.0-rc.1/DrakOps-0.1.0-rc.1-Walkthrough.mp4).
-- [macOS Apple Silicon: DrakOps 0.1.0 RC4](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.4): prerelease ZIP, ad-hoc signed and not Apple-notarized.
+- [macOS Apple Silicon: DrakOps 0.1.0 RC5](https://github.com/drakahari/DrakOps/releases/tag/v0.1.0-rc.5): prerelease ZIP, ad-hoc signed and not Apple-notarized.
 
 ## Quick start: connect to one computer
 
@@ -24,8 +24,8 @@ You’ll need a computer you control that already runs SSH, its address, and the
 If you can already log in the way you want, skip this. If your server asks for its account password each time and you want to use an existing SSH key instead:
 
 1. On the saved device, click **Set up SSH**, then **Use my SSH key** if the suggested key is the one you want. Otherwise choose a different **.pub** file.
-2. Review the destination and public-key fingerprint. On a Linux or macOS client with the system installer available, confirm the required checkboxes and click **Install this public key**. Enter any requested server password in the separate terminal, not in DrakOps. Run this only once for a key that is not already installed and needs standard access.
-3. If the installer says it added a key, close that terminal and start a new connection to check the login. On a Windows client, or if the installer is unavailable, choose **Copy reviewed public key** and follow the manual steps, or ask the server’s administrator.
+2. Review the destination and public-key fingerprint, confirm the required checkboxes, and click **Install key in trusted terminal** when available. Enter any requested password in that terminal, not in DrakOps. Windows guided setup requires direct, standard POSIX OpenSSH and a matching local key pair. On Linux and macOS, run the system installer only once for a key not already installed. If guided setup is unavailable or unsuitable, choose **Copy reviewed public key** or ask your administrator.
+3. Read the result in the trusted terminal; closing it does not confirm success. To try a fresh connection, close the setup terminal and choose **Open new SSH tab** under **Finish setup**. This leaves your existing tabs alone.
 
 The file ending in **.pub** is the public key you may add to the intended server account. Its matching **private key** stays on your computer; never copy it to the server or paste it into DrakOps.
 
@@ -49,6 +49,8 @@ cargo build --locked
 cargo run --locked -- --demo
 ```
 
+The Unix safe-storage test uses a disposable directory beneath the checkout. If the checkout is below a shared writable parent such as `/tmp`, set `DRAKOPS_TEST_PRIVATE_DIR` to an existing private, writable test directory.
+
 The demo contains only synthetic devices and advertisements, does not touch your regular profile, and disables live discovery and SSH. Launch without `--demo` for a fresh or existing inventory.
 
 The current candidate does not run service probes, sync between computers, or change SSH settings. Validate the Windows, macOS, and Linux build separately before calling all three supported.
@@ -66,7 +68,9 @@ Device type is optional. Type labels and illustrations are set in **Add device /
 
 ## SSH access and keys
 
-DrakOps does not read or store private keys or passwords. If you can already connect, skip **Set up SSH**. Tailscale SSH doesn’t use the public key reviewed here; regular OpenSSH over a Tailscale address can still use one. **Set up SSH** lets you check the exact host, port and account, independently verify the server fingerprint, and choose an OpenSSH .pub file. It opens **Set up key login**: use the suggested public key or choose another, then review the exact destination and its public-key fingerprint. Drag the window corner to resize setup. Host verification and manual help are under **Other ways to set up**. For another public file, use **Choose a different key** to reveal native Browse or the manual path. **Copy reviewed public key** copies only the approved snapshot for manual enrollment through an independently verified connection or an authorized administrator. Copy itself does not change a server. On supported Linux and macOS clients, **Install this public key** hands only the reviewed snapshot to system ssh-copy-id in an external terminal. Verify the host first, confirm the key is not already installed for this account, and use this only for standard SSH access. If access needs restrictions or you are unsure, use the manual steps. Repeating the standard installer can append a duplicate. Windows uses manual setup. DrakOps doesn't collect passwords, confirm installer success, or prove selected-key authentication. Keep existing keys and authentication methods. The wizard requires additional explicit confirmation for an existing root account.
+Use **Verify this server** by **Connect** for first-time verification help. Compare the fingerprint shown in the external terminal with one from the server console or your administrator before accepting it. If the terminal reports a changed identity, stop and investigate. If asked for your account password after verifying the server, type it in that same terminal; the characters are hidden.
+
+DrakOps does not read or store private keys or passwords. If you can already connect, skip **Set up SSH**. Tailscale SSH doesn’t use the public key reviewed here; regular OpenSSH over a Tailscale address can still use one. **Set up SSH** lets you check the exact host, port and account, independently verify the server fingerprint, and choose an OpenSSH .pub file. It opens **Set up key login**: use the suggested public key or choose another, then review the exact destination and its public-key fingerprint. Drag the window corner to resize setup. Host verification and manual help are under **Other ways to set up**. For another public file, use **Choose a different key** to reveal native Browse or the manual path. **Copy reviewed public key** copies only the approved snapshot for manual enrollment through an independently verified connection or an authorized administrator. Copy itself does not change a server. On supported Linux and macOS clients, **Install key in trusted terminal** hands only the reviewed snapshot to system ssh-copy-id in an external terminal. Verify the host first, confirm the key is not already installed for this account, and use this only for standard SSH access. If access needs restrictions or you are unsure, use the manual steps. Repeating the standard installer can append a duplicate. On Windows, **Install key in trusted terminal** supports a Linux or Unix server with standard OpenSSH and a matching local private-key file beside the reviewed .pub. Confirm the destination/account and that standard setup is appropriate. It opens an independent Windows terminal, checks for working key login, and only if needed requests that the reviewed public key be added to the selected account. Enter any private-key passphrase or server password in the native OpenSSH terminal, never DrakOps. OpenSSH proves the local file pairs with the reviewed public key before adding anything. Existing entries are kept, and an existing entry for that key is not added again. The terminal reports whether a fresh key-only check confirmed the reviewed fingerprint; a key that needs to be unlocked or a restricted account may not pass that check. An interrupted setup can leave the key installed. Do not treat a closed terminal as success. This Windows workflow uses standard direct OpenSSH settings and an already trusted host. The target must use normal account-owned `.ssh/authorized_keys` storage in an owned, non-shared POSIX directory hierarchy. Use manual setup for jump hosts, aliases that rely on SSH configuration, nonstandard permissions or key locations, or configurations that don’t accept an OpenSSH exec shell. Unix-client handoff does not prove selected-key authentication. DrakOps never reads or stores passwords or private keys. Keep existing keys and authentication methods. The wizard requires additional explicit confirmation for an existing root account.
 
 ## Themes and provenance
 

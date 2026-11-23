@@ -4,6 +4,13 @@ use std::{collections::HashSet,fs::{self,File}, io::{Read,Write}, path::{Path,Pa
 
 const MAX_PUBLIC_BYTES:u64=16*1024;
 
+pub(super) fn verification_guidance(ui:&mut egui::Ui){
+    ui.label("Already verified? Use Connect.");
+    ui.label("First connection? Open the external terminal and compare the fingerprint it shows with one from the server console or your administrator. Accept only if they match.");
+    ui.label("If the terminal asks for your account password after that, type it in that same terminal. The characters are hidden.");
+    ui.label("If the terminal says the server identity changed, stop. Ask your administrator or check the server console before proceeding.");
+}
+
 fn public_path(raw:&str)->Result<(PathBuf,String),String>{
     let p=PathBuf::from(raw.trim());
     if !p.is_absolute() || p.extension().and_then(|x|x.to_str())!=Some("pub") {
@@ -217,7 +224,17 @@ fn recommended_key(home:&Path)->Option<PathBuf>{
 }
 
 #[derive(Default)]
-pub(super) struct InstallAttempts(HashSet<InstallIdentity>);
+pub(super) struct InstallAttempts {
+    unix_requested: HashSet<InstallIdentity>,
+    windows_id: Option<InstallIdentity>,
+    windows: LaunchFeedback,
+}
+impl InstallAttempts {
+    fn windows_pending(&self)->bool { self.windows.watch.is_some() }
+    fn poll_windows(&mut self,ctx:&egui::Context) {
+        self.windows.poll(ctx,"Setup terminal closed. Review its result before assuming the key works; start a fresh connection to test again.");
+    }
+}
 
 #[derive(PartialEq,Eq,Hash)]
 struct InstallIdentity {host:String,port:u16,user:String,fingerprint:String}
@@ -294,7 +311,8 @@ impl Setup {
 
     fn other_ways(&mut self,ui:&mut egui::Ui,enabled:bool,manual:bool,allow_copy:bool){
         ui.collapsing("Other ways to set up", |ui| {
-            ui.label("First connection? Compare the server fingerprint with a trusted source before accepting it. If the key changed, stop and find out why.");
+            ui.strong("Verify this server");
+            verification_guidance(ui);
             if ui.add_enabled(enabled && self.trust.watch.is_none(),egui::Button::new("Open in external terminal")).clicked(){
                 self.trust.start(external_terminal::open_tracked(&self.device,self.route),"External terminal requested. Check the server fingerprint there.");
             }
@@ -305,7 +323,7 @@ impl Setup {
         });
     }
 
-    pub(super) fn show(mut self,ctx:&egui::Context,attempts:&mut InstallAttempts)->Option<Self>{
+    pub(super) fn show(mut self,ctx:&egui::Context,attempts:&mut InstallAttempts,terminal:&mut crate::terminal_ui::TerminalUi,connection_allowed:bool)->Option<Self>{
         if let Some(picker)=&self.picker {
             match picker.try_recv(){
                 Ok(choice)=>{self.picker=None;if choice.is_some(){self.choose_key(choice);self.review_selected();}}
@@ -314,8 +332,13 @@ impl Setup {
             }
         }
         self.trust.poll(ctx,"Terminal launcher finished. Continue only after verifying the host fingerprint.");
-        self.install.poll(ctx,"Follow the external terminal prompts. If it says a key was added, close it and start a new connection.");
+        if cfg!(windows) {
+            attempts.poll_windows(ctx);
+        } else {
+            self.install.poll(ctx,"Follow the external terminal prompts. If it says a key was added, close it and start a new connection.");
+        }
         let mut open=true;
+        let mut open_new_tab=false;
         wizard_window(ctx,&mut open).show(ctx,|ui|{
             wizard_style(ui);
                 let name=if self.device.name.is_empty(){&self.device.alias}else{&self.device.name};
@@ -325,7 +348,7 @@ impl Setup {
                 let invalid=destination(&self.device,self.route).err();
                 if let Some(e)=&invalid{ui.colored_label(crate::theme::roles(ctx).error,e);}
                 let enabled=invalid.is_none();
-                let can_edit=enabled && self.picker.is_none() && self.install.watch.is_none();
+                let can_edit=enabled && self.picker.is_none() && self.install.watch.is_none() && !attempts.windows_pending();
                 ui.separator();
 
                 if !self.reviewing {
@@ -381,28 +404,63 @@ impl Setup {
                     }
                     let valid_key=matches!(self.key_check,Some(Ok(_)));
                     let ready=can_edit && install_blocker(valid_key,self.consent,root_account(&self.device),self.root_consent).is_none();
-                    let automatic=external_terminal::system_copy_id().is_some();
+                    let automatic=external_terminal::guided_install_available();
                     if automatic {
                         let key=self.key_check.as_ref().and_then(|r|r.as_ref().ok());
-                        let already=key.is_some_and(|k|attempts.0.contains(&InstallIdentity::new(&self.device,self.route,k)));
+                        let identity=key.map(|k|InstallIdentity::new(&self.device,self.route,k));
+                        let already=if cfg!(windows) {attempts.windows_pending()} else {
+                            identity.as_ref().is_some_and(|id|attempts.unix_requested.contains(id))
+                        };
                         ui.add_enabled(can_edit && valid_key && !already,egui::Checkbox::new(&mut self.standard_install_consent,
-                            "I checked: this key is not already installed, and I want standard SSH access."));
+                            if cfg!(windows) {"This is a Linux or Unix account using standard OpenSSH key setup."}
+                            else {"I checked: this key is not already installed, and I want standard SSH access."}));
                         wizard_secondary(ui,"Need restrictions or not sure? Use the manual steps below.");
+                        if cfg!(windows) {
+                            wizard_secondary(ui,"Only the reviewed public key is sent. If asked, enter your key passphrase or server password in the trusted terminal. Read the result in that window.");
+                            wizard_secondary(ui,"Use manual setup if this connection needs a jump host, SSH alias settings, or custom server key storage.");
+                        }
                         let approved=standard_install_confirmed(&self.device,self.consent,self.root_consent,self.standard_install_consent);
-                        if wizard_action(ui,"Install this public key",ready && !already && approved).clicked()
+                        if wizard_action(ui,"Install key in trusted terminal",ready && !already && approved).clicked()
                             && let Some(key)=key
                             && let Some(line)=key.approved_line(&self.device,self.consent,self.root_consent)
-                            && attempts.0.insert(InstallIdentity::new(&self.device,self.route,key))
+                            && let Some(id)=identity
                         {
-                            let result=external_terminal::open_public_install(self.device.clone(),self.route,line);
-                            self.install.start(result,"Opening an external terminal. Enter any password there, not in DrakOps.");
+                            if cfg!(windows) {
+                                let result=external_terminal::open_public_install(self.device.clone(),self.route,line,&key.source,&key.fingerprint);
+                                attempts.windows_id=Some(id);
+                                attempts.windows.start(result,"Setup terminal opened. Read the result there, then close it to retry or continue.");
+                            } else if attempts.unix_requested.insert(id) {
+                                let result=external_terminal::open_public_install(self.device.clone(),self.route,line,&key.source,&key.fingerprint);
+                                self.install.start(result,"Opening an external terminal. Enter any password there, not in DrakOps.");
+                            }
                         }
-                        if already {ui.weak("Already requested for this key and account. Check the external terminal before doing anything else.");}
-                        if self.install.watch.is_some(){ui.spinner();}
-                        if !self.install.message.is_empty(){ui.label(&self.install.message);}
+                        if already {
+                            ui.weak(if cfg!(windows){"A setup terminal is open. Close it before starting another."}
+                                else{"Already requested for this key and account. Check the external terminal for the result."});
+                        }
+                        let feedback=if cfg!(windows) {
+                            attempts.windows_id.as_ref().filter(|id|key.is_some_and(|k|**id==InstallIdentity::new(&self.device,self.route,k)))
+                                .map(|_|&attempts.windows)
+                        } else {Some(&self.install)};
+                        if let Some(feedback)=feedback{
+                            if feedback.watch.is_some(){ui.spinner();}
+                            if !feedback.message.is_empty(){ui.label(&feedback.message);}
+                        }
                     } else {
                         self.manual_controls(ui,ready,true);
                     }
+                    ui.separator();
+                    ui.strong("Finish setup");
+                    if cfg!(windows) {
+                        wizard_secondary(ui,"Read the result in the separate terminal. Only a result that says key login worked or was verified confirms success. Closing that window does not confirm success.");
+                    } else {
+                        wizard_secondary(ui,"Read the result in the separate terminal. If it reports that the key was added, try a new connection to check that login works.");
+                    }
+                    if wizard_action(ui,"Open new SSH tab",can_edit && connection_allowed && terminal.has_tab_space()).clicked(){
+                        open_new_tab=true;
+                    }
+                    if !terminal.has_tab_space(){ui.weak("Close a tab to open a new one.");}
+                    wizard_secondary(ui,"This starts a fresh connection without reusing an open tab.");
                     ui.separator();
                     self.other_ways(ui,enabled,automatic,ready);
                     if ui.add_enabled(can_edit,egui::Button::new("Back")).clicked(){
@@ -412,6 +470,10 @@ impl Setup {
                 }
                 if !self.status.is_empty(){ui.label(&self.status);}
         });
+        if open_new_tab{
+            terminal.start_new_tab(&self.device,self.route);
+            return None;
+        }
         open.then_some(self)
     }
 }
@@ -536,11 +598,28 @@ mod tests{
         let mut attempts=InstallAttempts::default();
         let d=target();
         let mut key=ReviewedKey{source:"fixture.pub".into(),line:"public fixture".into(),fingerprint:"one".into()};
-        assert!(attempts.0.insert(InstallIdentity::new(&d,Route::Lan,&key)));
-        assert!(!attempts.0.insert(InstallIdentity::new(&d,Route::Lan,&key)));
-        assert!(attempts.0.insert(InstallIdentity::new(&Device{port:22,..d.clone()},Route::Lan,&key)));
+        assert!(attempts.unix_requested.insert(InstallIdentity::new(&d,Route::Lan,&key)));
+        assert!(!attempts.unix_requested.insert(InstallIdentity::new(&d,Route::Lan,&key)));
+        assert!(attempts.unix_requested.insert(InstallIdentity::new(&Device{port:22,..d.clone()},Route::Lan,&key)));
         key.fingerprint="two".into();
-        assert!(attempts.0.insert(InstallIdentity::new(&d,Route::Lan,&key)));
+        assert!(attempts.unix_requested.insert(InstallIdentity::new(&d,Route::Lan,&key)));
+    }
+
+    #[test]
+    fn windows_installer_can_retry_after_terminal_closes_or_fails() {
+        let ctx=egui::Context::default();
+        let mut attempts=InstallAttempts::default();
+        let (tx,rx)=mpsc::channel();
+        attempts.windows.start(Ok(rx),"Pending");
+        attempts.poll_windows(&ctx);
+        assert!(attempts.windows_pending());
+        tx.send(Ok(())).unwrap();
+        attempts.poll_windows(&ctx);
+        assert!(!attempts.windows_pending());
+        assert!(attempts.windows.message.contains("Review its result"));
+        attempts.windows.start(Err("No launch".into()),"Pending");
+        assert!(!attempts.windows_pending());
+        assert_eq!(attempts.windows.message,"No launch");
     }
 
     #[test]
