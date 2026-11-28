@@ -505,14 +505,34 @@ fn paste_bytes(text:&str)->Result<Vec<u8>, &'static str>{
     Ok(line.as_bytes().to_vec())
 }
 
+fn bracket_paste(bytes: &[u8]) -> Vec<u8> {
+    let mut wrapped = b"\x1b[200~".to_vec();
+    wrapped.extend_from_slice(bytes);
+    wrapped.extend_from_slice(b"\x1b[201~");
+    wrapped
+}
+
+fn reviewed_paste_bytes(text: &str, bracketed: bool) -> Result<Vec<u8>, &'static str> {
+    let line = text.trim_end_matches(['\r', '\n']);
+    if !bracketed || !line.contains(['\r', '\n']) {
+        return paste_bytes(text).map(|bytes| if bracketed { bracket_paste(&bytes) } else { bytes });
+    }
+    if line.len() > PASTE_LIMIT { return Err("Paste is limited to 4 KiB."); }
+    let lines = line.replace("\r\n", "\n").replace('\r', "\n");
+    if lines.chars().any(|c| (c != '\n' && c.is_control()) || matches!(c, '\u{2028}' | '\u{2029}')) {
+        return Err("Paste contains unsafe control characters. Nothing was sent.");
+    }
+    Ok(bracket_paste(lines.as_bytes()))
+}
+
 #[derive(Default)]
 struct TerminalInput {
     bytes:Vec<u8>,
-    paste:Option<Result<Vec<u8>, &'static str>>,
+    paste:Option<String>,
     copy:bool,
 }
 
-fn input_batch(events:&mut Vec<egui::Event>,app_cursor:bool,mac:bool)->TerminalInput{
+fn input_batch(events:&mut Vec<egui::Event>,app_cursor:bool,mac:bool,linux_paste:bool)->TerminalInput{
     let mut result=TerminalInput::default();
     let mut ambiguous=false;
     let mut pending_alt: Option<Option<u8>>=None;
@@ -534,10 +554,12 @@ fn input_batch(events:&mut Vec<egui::Event>,app_cursor:bool,mac:bool)->TerminalI
             if !mac && let Some(byte)=fallback {append(&mut result,&[27,byte]);}
         }
         match e {
-            // Non-Mac native clipboard events erase the original chord.
-            egui::Event::Paste(_) if !mac=>{ambiguous=true;return false;}
+            // Linux egui translates both standard paste chords into a
+            // native Paste event. Accept it only after terminal focus
+            // is explicitly armed; leave other platform policies intact.
+            egui::Event::Paste(_) if !mac && !linux_paste=>{ambiguous=true;return false;}
             egui::Event::Paste(s)=>{
-                if result.paste.is_none(){result.paste=Some(paste_bytes(s));}
+                if result.paste.is_none(){result.paste=Some(s.clone());}
                 return false;
             }
             egui::Event::Copy if !mac=>{ambiguous=true;return false;}
@@ -579,11 +601,11 @@ enum PasteDecision {Keep,Cancel,Send(Vec<u8>)}
 impl PasteDraft {
     fn new()->Self {Self{first_frame:true,..Default::default()}}
 
-    fn show(&mut self,ctx:&egui::Context,target:&str)->PasteDecision {
+    fn show(&mut self,ctx:&egui::Context,target:&str,bracketed:bool)->PasteDecision {
         let modal=egui::Modal::new(egui::Id::new("terminal-local-paste")).show(ctx,|ui|{
             ui.heading("Paste into terminal");
             ui.monospace(target);
-            ui.label("Paste into this local field, then choose Send to terminal. It won’t press Enter.");
+            ui.label("Review the text here, then choose Send to terminal. It won’t press Enter.");
             ui.weak("After sending, click the terminal to resume typing.");
             let mut input=egui::TextEdit::multiline(&mut self.text)
                 .id(egui::Id::new("terminal-local-paste-private-input")).desired_rows(2).desired_width(410.)
@@ -593,7 +615,10 @@ impl PasteDraft {
             // every render so cancelled/sent drafts never survive in that state.
             input.state.clear_undoer();
             if self.first_frame {input.response.request_focus();self.first_frame=false;}
-            let payload=paste_bytes(&self.text);
+            let payload=reviewed_paste_bytes(&self.text, bracketed);
+            if self.text.trim_end_matches(['\r','\n']).contains(['\r','\n']) && !bracketed {
+                ui.weak("This terminal did not enable safe multiline paste. Edit this down to one line, or use an external terminal.");
+            }
             if !self.text.is_empty() && let Err(e)=&payload{ui.weak(*e);}
             ui.horizontal(|ui|{
                 if ui.button("Cancel").clicked(){return PasteDecision::Cancel;}
@@ -638,7 +663,7 @@ fn keyboard(ui: &mut egui::Ui, hit: &egui::Response, requested: bool, running: b
     }
     if !*captured { return TerminalInput::default(); }
     ui.memory_mut(|m|m.set_focus_lock_filter(hit.id, egui::EventFilter { tab:true, horizontal_arrows:true, vertical_arrows:true, escape:true }));
-    ui.input_mut(|i| input_batch(&mut i.events,app_cursor,cfg!(target_os="macos")))
+    ui.input_mut(|i| input_batch(&mut i.events,app_cursor,cfg!(target_os="macos"),cfg!(target_os="linux")))
 }
 
 impl App {
@@ -727,6 +752,7 @@ impl TerminalUi {
                 let mut page_direction=0_isize;
                 let (mut offset, limit)=t.session.as_mut().map(Session::scrollback).unwrap_or_default();
                 let alternate=t.session.as_ref().is_some_and(|s|s.screen().alternate_screen());
+                let bracketed=cfg!(target_os="linux") && t.session.as_ref().is_some_and(|s|s.screen().bracketed_paste());
                 let page_rows=t.session.as_ref().map_or(1,|s|s.screen().size().0.saturating_sub(1).max(1)) as isize;
                 let previous_font=deck.terminal_font;
                 ui.horizontal_wrapped(|ui| {
@@ -749,7 +775,7 @@ impl TerminalUi {
                     if t.demo.is_some(){ui.weak("Read-only sample. No SSH connection.");}
                     if t.session.as_ref().is_some_and(|s| matches!(s.state(),terminal::State::Running)) {
                         paste_click=ui.add_enabled(!t.find.open,egui::Button::new("Paste").small())
-                            .on_hover_text("Review one line locally before sending").clicked();
+                            .on_hover_text("Review clipboard text locally before sending").clicked();
                         ui.weak(if deck.capture {"Keyboard active | Ctrl+Esc to release"} else {"Click terminal to type | Drag to select | Tab then F2 for keyboard"});
                     }
                     if t.session.is_some() {
@@ -831,7 +857,7 @@ impl TerminalUi {
                 if let Some(draft)=&mut deck.paste_draft {
                     if !running || !focused {deck.paste_draft=None;}
                     else {
-                        match draft.show(ctx,&t.target) {
+                        match draft.show(ctx,&t.target,bracketed) {
                             PasteDecision::Keep=>{}
                             PasteDecision::Cancel=>deck.paste_draft=None,
                             PasteDecision::Send(bytes)=>{submitted=Some(bytes);deck.paste_draft=None;}
@@ -932,8 +958,30 @@ impl TerminalUi {
                     deck.capture=false;t.error.clear();bytes
                 } else if running && deck.capture && !deck.copy_mode && !blocked && !navigating {
                     match routed.paste {
-                        Some(Ok(bytes))=>{t.error.clear();bytes}
-                        Some(Err(e))=>{t.error=e.into();Vec::new()}
+                        Some(text)=> {
+                            let multiline=text.trim_end_matches(['\r','\n']).contains(['\r','\n']);
+                            if cfg!(target_os="linux") && text.trim_end_matches(['\r','\n']).len()>PASTE_LIMIT {
+                                t.error="Paste is limited to 4 KiB.".into();
+                                Vec::new()
+                            } else if cfg!(target_os="linux") && multiline {
+                                // Never send real line breaks from the shortcut itself.
+                                deck.paste_draft=Some(PasteDraft{text,first_frame:true});
+                                deck.capture=false;
+                                Vec::new()
+                            } else {
+                                match paste_bytes(&text) {
+                                    Ok(_) if cfg!(target_os="linux") && alternate && !bracketed => {
+                                        t.error="Direct paste is unavailable in this full-screen program. Use Paste to review the text.".into();
+                                        Vec::new()
+                                    }
+                                    Ok(bytes)=>{
+                                        t.error.clear();
+                                        if bracketed {bracket_paste(&bytes)} else {bytes}
+                                    }
+                                    Err(e)=>{t.error=e.into();Vec::new()}
+                                }
+                            }
+                        }
                         None=>routed.bytes,
                     }
                 }else{Vec::new()};
@@ -1208,13 +1256,13 @@ mod tests {
     fn alt_meta_is_not_duplicated_with_text_and_option_unicode_stays_literal() {
         let alt=|key|egui::Event::Key{key,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::ALT};
         let mut events=vec![alt(Key::B),egui::Event::Text("b".into())];
-        assert_eq!(input_batch(&mut events,false,false).bytes,b"\x1bb");
+        assert_eq!(input_batch(&mut events,false,false,false).bytes,b"\x1bb");
         let mut events=vec![alt(Key::B)];
-        assert_eq!(input_batch(&mut events,false,false).bytes,b"\x1bb");
+        assert_eq!(input_batch(&mut events,false,false,false).bytes,b"\x1bb");
         let mut events=vec![alt(Key::B),egui::Event::Text("∫".into())];
-        assert_eq!(input_batch(&mut events,false,true).bytes,"∫".as_bytes());
+        assert_eq!(input_batch(&mut events,false,true,false).bytes,"∫".as_bytes());
         let mut events=vec![alt(Key::V),egui::Event::Paste("do not forward".into()),egui::Event::Text("x".into())];
-        assert!(input_batch(&mut events,false,false).bytes.is_empty());
+        assert!(input_batch(&mut events,false,false,false).bytes.is_empty());
     }
 
     #[test]
@@ -1405,10 +1453,10 @@ mod tests {
             events,focused:true,screen_rect:Some(egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(700.,500.))),
             ..Default::default()
         };
-        let _=ctx.run(raw(vec![]),|ctx|assert!(matches!(draft.show(ctx,"fixture@example:22"),PasteDecision::Keep)));
+        let _=ctx.run(raw(vec![]),|ctx|assert!(matches!(draft.show(ctx,"fixture@example:22",false),PasteDecision::Keep)));
         let enter=egui::Event::Key{key:Key::Enter,physical_key:None,pressed:true,repeat:false,modifiers:egui::Modifiers::NONE};
         let _=ctx.run(raw(vec![egui::Event::Paste("safe marker".into()),enter]),|ctx|
-            assert!(matches!(draft.show(ctx,"fixture@example:22"),PasteDecision::Keep)));
+            assert!(matches!(draft.show(ctx,"fixture@example:22",false),PasteDecision::Keep)));
         assert_eq!(paste_bytes(&draft.text),Ok(b"safe marker".to_vec()));
         let mut deck=TerminalUi{paste_draft:Some(draft),tabs:vec![TerminalTab::default(),TerminalTab::default()],..Default::default()};
         deck.select(1);
@@ -1426,14 +1474,14 @@ mod tests {
             ..Default::default()
         };
         let mut old=PasteDraft::new();
-        let _=ctx.run(raw(vec![]),|ctx|{old.show(ctx,"fixture-one");});
-        let _=ctx.run(raw(vec![egui::Event::Paste("temporary fixture only".into())]),|ctx|{old.show(ctx,"fixture-one");});
+        let _=ctx.run(raw(vec![]),|ctx|{old.show(ctx,"fixture-one",false);});
+        let _=ctx.run(raw(vec![egui::Event::Paste("temporary fixture only".into())]),|ctx|{old.show(ctx,"fixture-one",false);});
         assert!(!old.text.is_empty());
         drop(old);
         let mut new=PasteDraft::new();
-        let _=ctx.run(raw(vec![]),|ctx|{new.show(ctx,"fixture-two");});
+        let _=ctx.run(raw(vec![]),|ctx|{new.show(ctx,"fixture-two",false);});
         let undo=egui::Event::Key{key:Key::Z,physical_key:None,pressed:true,repeat:false,modifiers:egui::Modifiers::COMMAND};
-        let _=ctx.run(raw(vec![undo]),|ctx|assert!(matches!(new.show(ctx,"fixture-two"),PasteDecision::Keep)));
+        let _=ctx.run(raw(vec![undo]),|ctx|assert!(matches!(new.show(ctx,"fixture-two",false),PasteDecision::Keep)));
         assert!(new.text.is_empty());
     }
 
@@ -1445,15 +1493,82 @@ mod tests {
         assert!(paste_bytes(&"x".repeat(PASTE_LIMIT+1)).is_err());
         for event in [egui::Event::Copy,egui::Event::Paste("fixture".into())] {
             let mut events=vec![event,key(Key::Enter,egui::Modifiers::NONE)];
-            let result=input_batch(&mut events,false,false);
+            let result=input_batch(&mut events,false,false,false);
             assert!(result.bytes.is_empty() && !result.copy && result.paste.is_none());
         }
         let mut events=vec![key(Key::V,egui::Modifiers::MAC_CMD),egui::Event::Paste("one\r\n".into()),key(Key::Enter,egui::Modifiers::NONE)];
-        let result=input_batch(&mut events,false,true);
+        let result=input_batch(&mut events,false,true,false);
         assert!(result.bytes.is_empty());
-        assert_eq!(result.paste.unwrap().unwrap(),b"one");
+        assert_eq!(paste_bytes(&result.paste.unwrap()).unwrap(),b"one");
         let mut events=vec![egui::Event::Copy];
-        assert!(input_batch(&mut events,false,true).copy);
+        assert!(input_batch(&mut events,false,true,false).copy);
+    }
+
+    #[test]
+    fn linux_paste_event_drops_enter_and_ignores_duplicate_payloads() {
+        let mut events=vec![
+            egui::Event::Paste("hostname\r\n".into()),
+            egui::Event::Paste("duplicate".into()),
+            egui::Event::Key {key:Key::Enter,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::NONE},
+        ];
+        let result=input_batch(&mut events,false,false,true);
+        assert!(result.bytes.is_empty() && events.is_empty());
+        assert_eq!(paste_bytes(&result.paste.unwrap()).unwrap(),b"hostname");
+    }
+
+    #[test]
+    fn reviewed_multiline_requires_bracketed_mode_and_rejects_embedded_control_sequences() {
+        let text="hostname\r\nuptime\n";
+        assert!(reviewed_paste_bytes(text,false).is_err());
+        assert_eq!(reviewed_paste_bytes(text,true).unwrap(),b"\x1b[200~hostname\nuptime\x1b[201~");
+        assert_eq!(reviewed_paste_bytes("host\n",true).unwrap(),b"\x1b[200~host\x1b[201~");
+        for text in ["a\nb\x1b[201~", "a\nb\x00", "a\nb\u{2028}", "a\nb\t"] {
+            assert!(reviewed_paste_bytes(text,true).is_err());
+        }
+        assert!(reviewed_paste_bytes(&format!("a\n{}", "x".repeat(PASTE_LIMIT)),true).is_err());
+    }
+
+    #[cfg(target_os="linux")]
+    #[test]
+    fn focused_linux_terminal_pastes_one_line_and_reviews_multiple_lines_locally() {
+        let ctx=egui::Context::default();
+        let (session,io)=crate::terminal::tests::synthetic_io();
+        let mut deck=TerminalUi {
+            show:true,
+            tabs:vec![TerminalTab {id:125,session:Some(session),target:"fixture".into(),..Default::default()}],
+            ..Default::default()
+        };
+        let frame=|deck:&mut TerminalUi,events| {
+            let bounds=egui::Rect::from_min_size(egui::Pos2::ZERO,egui::vec2(800.,600.));
+            ctx.run(egui::RawInput{screen_rect:Some(bounds),focused:true,events,..Default::default()},|ctx|deck.panel(ctx,false))
+        };
+        let paste=|text:&str|egui::Event::Paste(text.into());
+        let enter=||egui::Event::Key {key:Key::Enter,physical_key:None,pressed:true,repeat:false,modifiers:Modifiers::NONE};
+        let body=egui::pos2(350.,540.);
+        let pointer=|pressed|egui::Event::PointerButton{pos:body,button:egui::PointerButton::Primary,pressed,modifiers:Modifiers::NONE};
+
+        let _=frame(&mut deck,vec![paste("not focused")]);
+        assert!(io.input.try_recv().is_err());
+        let _=frame(&mut deck,vec![egui::Event::PointerMoved(body),pointer(true)]);
+        let _=frame(&mut deck,vec![pointer(false)]);
+        assert!(deck.capture);
+
+        let _=frame(&mut deck,vec![paste("hostname\r\n"),enter()]);
+        assert_eq!(io.input.try_recv().unwrap(),b"hostname");
+        assert!(io.input.try_recv().is_err());
+        let _=frame(&mut deck,vec![enter()]);
+        assert_eq!(io.input.try_recv().unwrap(),b"\r");
+        let _=frame(&mut deck,vec![paste("reject \x1b[1~")]);
+        assert!(io.input.try_recv().is_err());
+
+        let _=frame(&mut deck,vec![paste("hostname\nuptime"),enter()]);
+        assert_eq!(deck.paste_draft.as_ref().unwrap().text,"hostname\nuptime");
+        assert!(!deck.capture && io.input.try_recv().is_err());
+        let _=frame(&mut deck,vec![]);
+        let _=frame(&mut deck,vec![enter()]);
+        assert!(io.input.try_recv().is_err());
+        deck.select(0);
+        assert!(io.input.try_recv().is_err());
     }
 
     #[test]
